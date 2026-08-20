@@ -75,8 +75,11 @@ die()  { printf '\n%serror:%s %s\n' "$red" "$rst" "$*" >&2; exit 1; }
 # When this script is piped from curl, stdin is the script itself — prompts
 # must read the keyboard directly. If there is no terminal at all (CI), the
 # install has to be driven entirely by environment variables.
+# `[ -r /dev/tty ]` passes even where the device cannot actually be opened
+# (some CI harnesses report "Device not configured" only on open), so probe by
+# really opening it in both directions.
 TTY=""
-if [ -r /dev/tty ] && [ -w /dev/tty ]; then TTY=/dev/tty; fi
+if (exec 3</dev/tty) 2>/dev/null && (exec 3>/dev/tty) 2>/dev/null; then TTY=/dev/tty; fi
 
 prompt() { # prompt <question> -> echoes the answer
   local q="$1" reply=""
