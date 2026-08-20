@@ -374,7 +374,7 @@ ok "config written to $HOME_DIR/env"
 
 # When piped from curl there is no local checkout, so companion files are
 # fetched: qbraid.com first (allowlisted on networks that block GitHub), then
-# raw.githubusercontent, then `gh` for the window where the repo is private.
+# raw.githubusercontent, then `gh` as a last resort if both are unreachable.
 SRC_DIR=""
 if [ -f "${BASH_SOURCE[0]:-}" ]; then
   CAND=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -389,7 +389,7 @@ fetch_file() { # fetch_file <name> <dest>
   if curl -fsSL -m 30 -o "$dest" "$SITE_BASE/$name" 2>/dev/null && [ -s "$dest" ]; then return 0; fi
   if curl -fsSL -m 30 -o "$dest" "$RAW_BASE/$name" 2>/dev/null && [ -s "$dest" ]; then return 0; fi
   command -v gh >/dev/null 2>&1 \
-    || die "could not download $name. While this repository is private you need the GitHub CLI: https://cli.github.com"
+    || die "could not download $name from qbraid.com or GitHub. Check your connection and re-run."
   gh api -H "Accept: application/vnd.github.raw" "$GH_CONTENTS/$name" > "$dest" \
     || die "could not download $name — is \`gh auth login\` done, and are you in the qBraid org?"
   [ -s "$dest" ] || die "downloaded $name but it is empty."

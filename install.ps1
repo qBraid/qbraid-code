@@ -262,7 +262,7 @@ Ok "config written to $envPath"
 
 # When piped through `iex` there is no local checkout, so companion files are
 # fetched over HTTP. `gh` covers the window where the repository is still
-# private and raw.githubusercontent.com 404s.
+# unreachable; `gh` is a last resort.
 $SrcDir = $null
 if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'qbraid-code.cmd'))) {
     $SrcDir = $PSScriptRoot
@@ -295,7 +295,7 @@ function Fetch-File {
     }
 
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        Die "could not download $Name. While this repository is private you need the GitHub CLI: https://cli.github.com"
+        Die "could not download $Name from qbraid.com or GitHub. Check your connection and re-run."
     }
     $text = (gh api -H 'Accept: application/vnd.github.raw' "$GhContents/$Name" | Out-String)
     if ($LASTEXITCODE -ne 0 -or -not $text) {
