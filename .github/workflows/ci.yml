@@ -72,3 +72,6 @@ jobs:
           call qbraid-code.cmd --help
           if not errorlevel 1 exit /b 1
           echo missing-install path reports an error
+          rem `echo` does not reset ERRORLEVEL in cmd, so the expected 1 would
+          rem otherwise leak out and fail the step.
+          exit /b 0
