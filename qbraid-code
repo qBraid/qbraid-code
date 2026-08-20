@@ -55,7 +55,8 @@ case "${1:-}" in
       BODY=$(cat "$TMP"); rm -f "$TMP"
       case "$STATUS" in
         200)
-          RAW=$(printf '%s' "$BODY" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
+          # pipefail + set -e would kill --doctor silently if the field is absent.
+          RAW=$(set +o pipefail; printf '%s' "$BODY" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
           CREDITS=$(awk -v c="$RAW" 'BEGIN { printf "%.0f", c }' 2>/dev/null) || CREDITS="$RAW"
           echo "key:      valid"
           echo "credits:  ${CREDITS:-unknown}"
