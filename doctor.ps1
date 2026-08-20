@@ -72,3 +72,11 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 Write-Host "model:    $model"
+
+$proxyBin = $settings['QBRAID_CODE_PROXY_BIN']
+if ($proxyBin -and (Test-Path $proxyBin)) {
+    $st = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $HomeDir 'qbraid-proxy.ps1') status 2>$null
+    Write-Host "gpt:      proxy $st"
+} else {
+    Write-Host 'gpt:      NOT AVAILABLE - re-run the installer to add GPT models'
+}

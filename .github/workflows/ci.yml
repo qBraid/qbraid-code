@@ -18,7 +18,7 @@ jobs:
         run: brew install shellcheck
 
       - name: shellcheck
-        run: shellcheck -S warning install.sh qbraid-code statusline.sh tests/statusline.sh tests/extractors.sh
+        run: shellcheck -S warning install.sh qbraid-code statusline.sh tests/statusline.sh tests/extractors.sh tests/model-routing.sh
 
       - name: syntax
         run: |
@@ -31,6 +31,9 @@ jobs:
 
       - name: extractor tests
         run: tests/extractors.sh
+
+      - name: model routing tests
+        run: tests/model-routing.sh
 
       - name: installer --help does not touch the machine
         run: bash install.sh --help

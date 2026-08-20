@@ -27,6 +27,11 @@ set "QBRAID_CODE_TOKEN="
 set "QBRAID_CODE_MODEL="
 for /f "usebackq eol=# tokens=1,* delims==" %%a in ("%QC_HOME%\env") do set "%%a=%%b"
 
+if /i "%~1"=="--stop" (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1" stop
+  exit /b !ERRORLEVEL!
+)
+
 if /i "%~1"=="--doctor" (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\doctor.ps1"
   exit /b !ERRORLEVEL!
@@ -38,6 +43,27 @@ if /i "%~1"=="-h"     goto :help
 if not defined QBRAID_CODE_TOKEN goto :incomplete
 if not defined QBRAID_CODE_BASE_URL goto :incomplete
 if not defined QBRAID_CODE_MODEL goto :incomplete
+
+rem Determine the model actually requested: an explicit --model wins over the
+rem configured default. Only the value matters; args still pass through whole.
+set "RUNMODEL=%QBRAID_CODE_MODEL%"
+set "PREV="
+for %%a in (%*) do (
+  if defined PREV set "RUNMODEL=%%~a" & set "PREV="
+  if /i "%%~a"=="--model" set "PREV=1"
+)
+
+set "RUNBASE=%QBRAID_CODE_BASE_URL%"
+set "RUNTOKEN=%QBRAID_CODE_TOKEN%"
+if /i not "%RUNMODEL:~0,4%"=="gpt-" goto :direct
+rem GPT route: the loopback proxy translates Anthropic Messages to the
+rem gateway's OpenAI surface. Azure caps tools at 128; with many MCP servers
+rem use --strict-mcp-config.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1" ensure
+if errorlevel 1 exit /b 1
+set /p RUNTOKEN=<"%QC_HOME%\proxy.key"
+set "RUNBASE=http://127.0.0.1:8320"
+:direct
 
 where claude >nul 2>&1
 if errorlevel 1 (
@@ -55,11 +81,11 @@ rem which the gateway rejects (accepts enabled/disabled only) - every request
 rem would 400. Forced: an inherited value re-enables thinking and breaks every
 rem request. Remove once the gateway accepts adaptive.
 set "MAX_THINKING_TOKENS=0"
-set "ANTHROPIC_BASE_URL=%QBRAID_CODE_BASE_URL%"
-set "ANTHROPIC_AUTH_TOKEN=%QBRAID_CODE_TOKEN%"
-set "ANTHROPIC_MODEL=%QBRAID_CODE_MODEL%"
-set "ANTHROPIC_SMALL_FAST_MODEL=%QBRAID_CODE_MODEL%"
-set "CLAUDE_CODE_SUBAGENT_MODEL=%QBRAID_CODE_MODEL%"
+set "ANTHROPIC_BASE_URL=%RUNBASE%"
+set "ANTHROPIC_AUTH_TOKEN=%RUNTOKEN%"
+set "ANTHROPIC_MODEL=%RUNMODEL%"
+set "ANTHROPIC_SMALL_FAST_MODEL=%RUNMODEL%"
+set "CLAUDE_CODE_SUBAGENT_MODEL=%RUNMODEL%"
 
 claude %*
 exit /b !ERRORLEVEL!

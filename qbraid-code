@@ -22,6 +22,55 @@ BASE_URL="${QBRAID_CODE_BASE_URL:-}"
 API_BASE="${QBRAID_CODE_API_BASE:-}"
 TOKEN="${QBRAID_CODE_TOKEN:-}"
 MODEL="${QBRAID_CODE_MODEL:-}"
+PROXY_PORT="${QBRAID_CODE_PROXY_PORT:-8320}"
+PROXY_BIN="${QBRAID_CODE_PROXY_BIN:-}"
+PROXY_URL="http://127.0.0.1:$PROXY_PORT"
+
+# ---------------------------------------------------------------- GPT proxy
+# The gateway serves GPT models only on its OpenAI-compat surface, which
+# Claude Code cannot speak. A loopback CLIProxyAPI translates; it is started
+# here on demand and only when a gpt-* model is actually requested.
+
+proxy_listening() {
+  [ -s "$HOME_DIR/proxy.key" ] || return 1
+  curl -fs -m 3 -o /dev/null "$PROXY_URL/v1/models" \
+    -H "Authorization: Bearer $(cat "$HOME_DIR/proxy.key")" 2>/dev/null
+}
+
+start_proxy() {
+  proxy_listening && return 0
+  [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] || {
+    echo "qbraid-code: GPT models need the local proxy, which is not installed." >&2
+    echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
+    return 1
+  }
+  [ -s "$HOME_DIR/proxy-config.yaml" ] || {
+    echo "qbraid-code: proxy config missing — re-run the installer." >&2
+    return 1
+  }
+  nohup "$PROXY_BIN" -config "$HOME_DIR/proxy-config.yaml" \
+    >> "$HOME_DIR/proxy.log" 2>&1 &
+  i=0
+  while [ "$i" -lt 40 ]; do
+    proxy_listening && return 0
+    sleep 0.3
+    i=$((i + 1))
+  done
+  echo "qbraid-code: proxy failed to start — see $HOME_DIR/proxy.log" >&2
+  return 1
+}
+
+# The requested model decides the route: an explicit --model wins over the
+# configured default. Only the value matters; everything else passes through.
+requested_model() {
+  local prev="" a
+  for a in "$@"; do
+    if [ "$prev" = "--model" ]; then printf '%s' "$a"; return; fi
+    case "$a" in --model=*) printf '%s' "${a#--model=}"; return ;; esac
+    prev="$a"
+  done
+  printf '%s' "$MODEL"
+}
 
 missing_keys() {
   local missing=""
@@ -33,6 +82,13 @@ missing_keys() {
 }
 
 case "${1:-}" in
+  --stop)
+    if [ -n "$PROXY_BIN" ] && pkill -f "$PROXY_BIN -config $HOME_DIR/proxy-config.yaml" 2>/dev/null; then
+      echo "qbraid-code: proxy stopped"
+    else
+      echo "qbraid-code: proxy was not running"
+    fi
+    exit 0 ;;
   --doctor)
     command -v claude >/dev/null 2>&1 \
       && echo "claude:   $(claude --version 2>/dev/null || echo present)" \
@@ -93,6 +149,16 @@ case "${1:-}" in
     fi
 
     echo "model:    ${MODEL:-not set}"
+
+    if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ]; then
+      if proxy_listening; then
+        echo "gpt:      proxy running on $PROXY_URL"
+      else
+        echo "gpt:      proxy installed (starts on demand with --model gpt-...)"
+      fi
+    else
+      echo "gpt:      NOT AVAILABLE — re-run the installer to add GPT models"
+    fi
     exit 0 ;;
   --help|-h)
     cat <<EOF
@@ -101,6 +167,8 @@ qbraid-code — Claude Code, powered by the qBraid AI gateway.
   qbraid-code [claude args...]   start a session
   qbraid-code -p "..."           ask one question and exit
   qbraid-code --doctor           check your setup
+  qbraid-code --stop             stop the background GPT proxy
+  qbraid-code --model gpt-5.6-sol ...   use a GPT model (starts a local proxy)
 
 Any other arguments are passed straight through to \`claude\`, so
 \`-c\`, \`--allowedTools\`, \`--model\`, and the rest behave normally.
@@ -124,6 +192,20 @@ command -v claude >/dev/null 2>&1 || {
   exit 1
 }
 
+RUN_MODEL=$(requested_model "$@")
+RUN_BASE="$BASE_URL"
+RUN_TOKEN="$TOKEN"
+case "$RUN_MODEL" in
+  gpt-*)
+    # GPT route: loopback proxy translates Anthropic Messages to the
+    # gateway's OpenAI surface. Azure caps `tools` at 128 — with many MCP
+    # servers Claude Code exceeds it; --strict-mcp-config avoids that.
+    start_proxy || exit 1
+    RUN_BASE="$PROXY_URL"
+    RUN_TOKEN=$(cat "$HOME_DIR/proxy.key")
+    ;;
+esac
+
 # ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which the gateway
 # accepts. ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the
 # user to approve a custom API key on first run — a prompt with no good answer
@@ -131,14 +213,14 @@ command -v claude >/dev/null 2>&1 || {
 #
 # MAX_THINKING_TOKENS=0: recent Claude Code sends `thinking: {type: "adaptive"}`,
 # which the gateway's Anthropic surface rejects (it accepts enabled|disabled —
-# qbraid-api ai-request.validators.ts), turning every request into a 400.
+# qbraid-api ai-request.validators.ts) and GPT models reject outright.
 # FORCED, not defaulted: an inherited MAX_THINKING_TOKENS from the user's
-# shell re-enables thinking and turns every request into that 400. Remove the
-# whole line once the gateway accepts "adaptive".
+# shell re-enables thinking and turns every request into that 400. Relax to
+# Claude-only once the gateway accepts "adaptive".
 MAX_THINKING_TOKENS=0 \
-ANTHROPIC_BASE_URL="$BASE_URL" \
-ANTHROPIC_AUTH_TOKEN="$TOKEN" \
-ANTHROPIC_MODEL="$MODEL" \
-ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
-CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
+ANTHROPIC_BASE_URL="$RUN_BASE" \
+ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
+ANTHROPIC_MODEL="$RUN_MODEL" \
+ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
+CLAUDE_CODE_SUBAGENT_MODEL="$RUN_MODEL" \
 exec claude "$@"

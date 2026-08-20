@@ -43,6 +43,24 @@ qbraid-code --doctor             # check your setup
 Every other flag goes straight through to `claude`, so `-c`, `--model`,
 `--allowedTools` and the rest behave normally.
 
+### GPT models
+
+The gateway also serves OpenAI GPT models, and `qbraid-code` can use them:
+
+```bash
+qbraid-code --model gpt-5.6-sol
+qbraid-code --model gpt-5.4-mini -p "explain this error"
+```
+
+Claude Code speaks the Anthropic API and the gateway serves GPT only on its
+OpenAI-compatible surface, so the first GPT request starts a small local
+translation proxy (CLIProxyAPI, loopback only, installed by the installer).
+Claude models never touch it. `qbraid-code --stop` shuts it down.
+
+Two caveats: GPT models accept at most 128 tools, so with many MCP servers
+add `--strict-mcp-config`; and the `/model` picker inside a session lists
+Claude models only — choose a GPT model at launch with `--model`.
+
 A session looks like this:
 
 ```
@@ -104,6 +122,9 @@ claude mcp login qbraid
 | `~/.qbraid-code/statusline.sh` | statusline script (`statusline.ps1` on Windows) |
 | `~/.qbraid-code/credits.cache` | last known credit balance, refreshed every 60s |
 | `~/.qbraid-code/credits.attempt` | when a refresh was last tried, so failures back off |
+| `~/.qbraid-code/proxy-config.yaml` | GPT translation proxy config (mode `600`, holds your key) |
+| `~/.qbraid-code/proxy.key` | loopback bearer for the proxy |
+| `~/.qbraid-code/proxy.log` | proxy output |
 | `~/.local/bin/qbraid-code` | the launcher (`qbraid-code.cmd` on Windows) |
 | `~/.claude/settings.json` | statusline wiring, plus gateway env with `--global` |
 
@@ -146,6 +167,7 @@ bash install.sh
 ## Uninstall
 
 ```bash
+qbraid-code --stop
 rm -rf ~/.qbraid-code ~/.local/bin/qbraid-code
 claude mcp remove qbraid
 ```
