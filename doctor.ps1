@@ -32,13 +32,28 @@ if (Get-Command claude -ErrorAction SilentlyContinue) {
     Write-Host 'claude:   NOT INSTALLED'
 }
 
+# Separate transport failure from rejection. Reporting "REJECTED" for a dropped
+# connection sent people off to make a new key for no reason.
 try {
     $balance = Invoke-RestMethod -Uri "$apiBase/billing/credits/balance" `
         -Headers @{ 'X-API-Key' = $token } -TimeoutSec 20
     Write-Host 'key:      valid'
-    Write-Host "credits:  $($balance.data.qbraidCredits)"
+    $raw = $balance.data.qbraidCredits
+    if ($null -ne $raw) {
+        Write-Host "credits:  $([Math]::Round([double]$raw))"
+    } else {
+        Write-Host 'credits:  unknown'
+    }
 } catch {
-    Write-Host 'key:      REJECTED - make a new one at https://account.qbraid.com/account/api-keys'
+    $status = $null
+    if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+    if ($status -eq 401 -or $status -eq 403) {
+        Write-Host 'key:      REJECTED - make a new one at https://account.qbraid.com/account/api-keys'
+    } elseif ($status) {
+        Write-Host "key:      UNKNOWN - qBraid returned HTTP $status"
+    } else {
+        Write-Host 'key:      UNKNOWN - could not reach qBraid (check your connection)'
+    }
     Write-Host 'credits:  unknown'
 }
 

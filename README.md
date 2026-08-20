@@ -32,12 +32,19 @@ That is all. The installer:
 
 Re-running it is safe.
 
-> **While this repository is private**, `qbraid.com/code.sh` is not live yet. Use the
-> GitHub CLI instead (`gh auth login` first, and you must be in the `qBraid` org):
+> **While this repository is private**, neither `qbraid.com/code.sh` nor
+> `qbraid.com/code.ps1` is live yet. Use the GitHub CLI instead (`gh auth login`
+> first, and you must be in the `qBraid` org):
 >
 > ```bash
+> # macOS and Linux
 > gh api -H "Accept: application/vnd.github.raw" \
 >   /repos/qBraid/qbraid-code/contents/install.sh | bash
+> ```
+>
+> ```powershell
+> # Windows
+> gh api -H "Accept: application/vnd.github.raw" /repos/qBraid/qbraid-code/contents/install.ps1 | Out-String | iex
 > ```
 
 ## Use
@@ -54,7 +61,7 @@ Every other flag goes straight through to `claude`, so `-c`, `--model`,
 A session looks like this:
 
 ```
-qbraid-code ⎇ main │ Claude Opus 5 │ C13 █░░░░░ │ 4,281 credits
+qbraid-code ⎇ main │ Claude Opus 5 │ C13 █░░░░░ │ 4281 credits
 ```
 
 Folder and branch, the model you are talking to, how much of the context window
@@ -111,6 +118,7 @@ claude mcp login qbraid
 | `~/.qbraid-code/env` | your key, gateway URL and default model (mode `600`) |
 | `~/.qbraid-code/statusline.sh` | statusline script (`statusline.ps1` on Windows) |
 | `~/.qbraid-code/credits.cache` | last known credit balance, refreshed every 60s |
+| `~/.qbraid-code/credits.attempt` | when a refresh was last tried, so failures back off |
 | `~/.local/bin/qbraid-code` | the launcher (`qbraid-code.cmd` on Windows) |
 | `~/.claude/settings.json` | statusline wiring, plus gateway env with `--global` |
 
@@ -130,9 +138,10 @@ installer prints the line to add. On Windows, open a new terminal first.
 **Wrong organization** — credits come from the organization the key belongs to.
 Create a key under the organization you want, then re-run the installer.
 
-**Statusline did not appear** — on macOS without the Xcode Command Line Tools and
-with a `~/.claude/settings.json` that already exists, the installer cannot merge
-JSON safely and skips this step. It prints the snippet to add by hand.
+**Statusline did not appear** — when `python3` is unavailable (no Xcode Command
+Line Tools on macOS, or no `python3` on Linux) and `~/.claude/settings.json`
+already exists, the installer cannot merge JSON safely and skips this step. It
+prints the snippet to add by hand.
 
 ## Uninstall
 

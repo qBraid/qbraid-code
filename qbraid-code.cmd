@@ -1,12 +1,16 @@
 @echo off
-rem qbraid-code — Claude Code, powered by the qBraid AI gateway.
+rem qbraid-code - Claude Code, powered by the qBraid AI gateway.
 rem Installed by install.ps1; reads its settings from %USERPROFILE%\.qbraid-code\env.
 rem
 rem This is a .cmd rather than a PowerShell function on purpose: a .cmd on PATH
 rem works from cmd.exe, PowerShell and Windows Terminal with no profile edit and
 rem no execution-policy change, which are the two things that fail quietly for
 rem someone who just wants to start working.
-setlocal EnableExtensions
+rem
+rem EnableDelayedExpansion is required: %ERRORLEVEL% inside a parenthesised
+rem block is substituted when the block is PARSED, before the command in it has
+rem run, so `exit /b %ERRORLEVEL%` there always reports the old value.
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "QC_HOME=%USERPROFILE%\.qbraid-code"
 if defined QBRAID_CODE_HOME set "QC_HOME=%QBRAID_CODE_HOME%"
@@ -17,15 +21,23 @@ if not exist "%QC_HOME%\env" (
   exit /b 1
 )
 
+set "QBRAID_CODE_BASE_URL="
+set "QBRAID_CODE_API_BASE="
+set "QBRAID_CODE_TOKEN="
+set "QBRAID_CODE_MODEL="
 for /f "usebackq eol=# tokens=1,* delims==" %%a in ("%QC_HOME%\env") do set "%%a=%%b"
 
 if /i "%~1"=="--doctor" (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\doctor.ps1"
-  exit /b %ERRORLEVEL%
+  exit /b !ERRORLEVEL!
 )
 
 if /i "%~1"=="--help" goto :help
 if /i "%~1"=="-h"     goto :help
+
+if not defined QBRAID_CODE_TOKEN goto :incomplete
+if not defined QBRAID_CODE_BASE_URL goto :incomplete
+if not defined QBRAID_CODE_MODEL goto :incomplete
 
 where claude >nul 2>&1
 if errorlevel 1 (
@@ -36,7 +48,7 @@ if errorlevel 1 (
 
 rem ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which the gateway
 rem accepts. ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the
-rem user to approve a custom API key on first run — a prompt with no good answer
+rem user to approve a custom API key on first run - a prompt with no good answer
 rem for someone who just wants to start working.
 set "ANTHROPIC_BASE_URL=%QBRAID_CODE_BASE_URL%"
 set "ANTHROPIC_AUTH_TOKEN=%QBRAID_CODE_TOKEN%"
@@ -45,7 +57,12 @@ set "ANTHROPIC_SMALL_FAST_MODEL=%QBRAID_CODE_MODEL%"
 set "CLAUDE_CODE_SUBAGENT_MODEL=%QBRAID_CODE_MODEL%"
 
 claude %*
-exit /b %ERRORLEVEL%
+exit /b !ERRORLEVEL!
+
+:incomplete
+echo qbraid-code: "%QC_HOME%\env" is incomplete. 1>&2
+echo Re-run the installer: irm https://qbraid.com/code.ps1 ^| iex 1>&2
+exit /b 1
 
 :help
 echo qbraid-code - Claude Code, powered by the qBraid AI gateway.

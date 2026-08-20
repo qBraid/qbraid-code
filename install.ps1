@@ -30,6 +30,7 @@ $GatewayUrl  = "$ApiBase/ai"
 $McpName     = 'qbraid'
 $McpUrl      = 'https://mcp.qbraid.com/mcp'
 $KeysUrl     = 'https://account.qbraid.com/account/api-keys'
+$SiteBase    = 'https://qbraid.com/code'
 $RawBase     = 'https://raw.githubusercontent.com/qBraid/qbraid-code/main'
 $GhContents  = '/repos/qBraid/qbraid-code/contents'
 
@@ -42,7 +43,14 @@ $ClaudeJson = Join-Path $env:USERPROFILE '.claude.json'
 function Say  { param($m) Write-Host "==> $m" -ForegroundColor White }
 function Ok   { param($m) Write-Host "  + $m" -ForegroundColor Green }
 function Warn { param($m) Write-Host "  ! $m" -ForegroundColor Yellow }
-function Die  { param($m) Write-Host "`nerror: $m" -ForegroundColor Red; exit 1 }
+function Die {
+    param($m)
+    Write-Host "`nerror: $m" -ForegroundColor Red
+    # Under `irm | iex` in a fresh window, exiting closes the window with the
+    # message still on screen for a fraction of a second. Hold it open.
+    if ($Host.UI.RawUI) { try { Read-Host 'Press Enter to close' | Out-Null } catch { } }
+    exit 1
+}
 
 # StrictMode prohibits references to non-existent properties, so every read of
 # an API response goes through this instead of a direct dereference.
@@ -84,7 +92,9 @@ if (Get-Command claude -ErrorAction SilentlyContinue) {
     } catch {
         Die "Claude Code install failed: $_"
     }
-    $env:Path = "$BinDir;$env:Path"
+    # Anthropic's installer always writes to %USERPROFILE%\.local\bin; $BinDir is
+    # overridable and may be somewhere else entirely.
+    $env:Path = "$(Join-Path $env:USERPROFILE '.local\bin');$BinDir;$env:Path"
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
         Die 'Claude Code installed but `claude` is not on PATH. Open a new terminal and re-run.'
     }
@@ -145,7 +155,9 @@ if (-not $ApiKey) {
     Start-Process $KeysUrl -ErrorAction SilentlyContinue
 
     for ($attempt = 1; $attempt -le 5; $attempt++) {
-        $candidate = (Read-Host 'Paste your qBraid API key').Trim()
+        $secure = Read-Host 'Paste your qBraid API key' -AsSecureString
+        $candidate = ([Runtime.InteropServices.Marshal]::PtrToStringAuto(
+            [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))).Trim()
         if ($candidate) {
             $Balance = Get-Balance $candidate
             if ($Balance) { $ApiKey = $candidate; $KeySource = 'pasted'; break }
@@ -162,8 +174,8 @@ Ok "key accepted (from $KeySource)"
 # fields degrades instead of aborting the install.
 $balanceData = Get-Prop $Balance 'data'
 $OrgId   = Get-Prop $balanceData 'organizationId'
-$Credits = Get-Prop $balanceData 'qbraidCredits'
-if ($null -eq $Credits) { $Credits = 'unknown' }
+$CreditsRaw = Get-Prop $balanceData 'qbraidCredits'
+$Credits = if ($null -eq $CreditsRaw) { 'unknown' } else { [Math]::Round([double]$CreditsRaw) }
 # /organizations/current returns the organization document itself, so `name` is
 # the organization's. /organizations/me returns *membership* details, whose
 # name is the user's — labelling the confirmation with that would be worse than
@@ -206,7 +218,9 @@ if (-not $Model) {
         # Fetched live so new gateway models appear without a release here.
         $models = Invoke-RestMethod -Uri "$GatewayUrl/v1/models" `
             -Headers @{ 'X-API-Key' = $ApiKey } -TimeoutSec 25
-        $ids = @(Get-Prop $models 'data' | ForEach-Object { Get-Prop $_ 'id' }) | Where-Object { $_ }
+        # @() must wrap the WHOLE pipeline: a one-element pipeline unrolls back
+        # to a scalar, and $ids[0] on a String returns a single character.
+        $ids = @(Get-Prop $models 'data' | ForEach-Object { Get-Prop $_ 'id' } | Where-Object { $_ })
     } catch { }
 
     if ($ids.Count -eq 0) {
@@ -241,7 +255,7 @@ $envLines = @(
     "QBRAID_CODE_MODEL=$Model"
 )
 $envPath = Join-Path $HomeDir 'env'
-Set-Content -Path $envPath -Value $envLines -Encoding ASCII
+Write-RawText $envPath (($envLines -join "`n") + "`n")
 Ok "config written to $envPath"
 
 # ------------------------------------------------- 7. launcher and statusline
@@ -254,18 +268,40 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'qbraid-code.cmd'))) 
     $SrcDir = $PSScriptRoot
 }
 
+# Set-Content -Encoding UTF8 emits a BOM on Windows PowerShell 5.1, and a BOM
+# on a .cmd makes cmd.exe fail to parse its first line. Write bytes directly.
+function Write-RawText {
+    param([string]$Path, [string]$Text)
+    if ($Path.EndsWith('.cmd')) {
+        $Text = ($Text -replace "`r`n", "`n") -replace "`n", "`r`n"
+    }
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false))
+}
+
 function Fetch-File {
     param([string]$Name, [string]$Dest)
     if ($SrcDir) { Copy-Item (Join-Path $SrcDir $Name) $Dest -Force; return }
-    try {
-        Invoke-WebRequest -Uri "$RawBase/$Name" -OutFile $Dest -TimeoutSec 30 -UseBasicParsing
-        return
-    } catch { }
+
+    # qbraid.com first: that is the point of the proxy, on networks where
+    # raw.githubusercontent.com is blocked but qbraid.com is not.
+    foreach ($base in @($SiteBase, $RawBase)) {
+        try {
+            $r = Invoke-WebRequest -Uri "$base/$Name" -TimeoutSec 30 -UseBasicParsing
+            if ($r.StatusCode -eq 200 -and $r.Content) {
+                Write-RawText $Dest $r.Content
+                return
+            }
+        } catch { }
+    }
+
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
         Die "could not download $Name. While this repository is private you need the GitHub CLI: https://cli.github.com"
     }
-    gh api -H 'Accept: application/vnd.github.raw' "$GhContents/$Name" | Set-Content -Path $Dest -Encoding UTF8
-    if ($LASTEXITCODE -ne 0) { Die "could not download $Name — is ``gh auth login`` done, and are you in the qBraid org?" }
+    $text = (gh api -H 'Accept: application/vnd.github.raw' "$GhContents/$Name" | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not $text) {
+        Die "could not download $Name - is ``gh auth login`` done, and are you in the qBraid org?"
+    }
+    Write-RawText $Dest $text
 }
 
 $LauncherPath   = Join-Path $BinDir 'qbraid-code.cmd'
@@ -292,9 +328,9 @@ if (Confirm-Step "Skip Claude Code's introductory screens?" 'y') {
     if (Test-Path $ClaudeJson) {
         $cfg = Get-Content $ClaudeJson -Raw | ConvertFrom-Json
         $cfg | Add-Member -NotePropertyName hasCompletedOnboarding -NotePropertyValue $true -Force
-        $cfg | ConvertTo-Json -Depth 100 | Set-Content $ClaudeJson -Encoding UTF8
+        Write-RawText $ClaudeJson ($cfg | ConvertTo-Json -Depth 100)
     } else {
-        '{"hasCompletedOnboarding":true}' | Set-Content $ClaudeJson -Encoding UTF8
+        Write-RawText $ClaudeJson '{"hasCompletedOnboarding":true}'
     }
     Ok 'introductory screens will be skipped'
 } else {
@@ -323,9 +359,23 @@ if ($Global) {
     $envObj | Add-Member -NotePropertyName ANTHROPIC_SMALL_FAST_MODEL -NotePropertyValue $Model      -Force
     $cfg | Add-Member -NotePropertyName env -NotePropertyValue $envObj -Force
 }
-$cfg | ConvertTo-Json -Depth 100 | Set-Content $Settings -Encoding UTF8
+Write-RawText $Settings ($cfg | ConvertTo-Json -Depth 100)
 Ok "statusline enabled in $Settings"
-if ($Global) { Ok 'plain `claude` now uses qBraid too' }
+if ($Global) {
+    # settings.json now holds a live credential. Windows has no chmod; restrict
+    # the ACL to the current user so other accounts on the machine cannot read it.
+    try {
+        $acl = Get-Acl $Settings
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            $env:USERNAME, 'FullControl', 'Allow')))
+        Set-Acl -Path $Settings -AclObject $acl
+    } catch {
+        Warn "could not restrict permissions on $Settings - it contains your API key"
+    }
+    Ok 'plain `claude` now uses qBraid too'
+}
 
 # ------------------------------------------------------------------- 10. mcp
 
@@ -364,11 +414,17 @@ try {
             'Authorization'     = "Bearer $ApiKey"
             'anthropic-version' = '2023-06-01'
         } -ContentType 'application/json' -Body $body
+    if (Get-Prop $reply 'content') {
+        Ok 'end-to-end request succeeded'
+    } else {
+        Warn 'the gateway replied but not with a message. Run `qbraid-code --doctor`.'
+    }
 } catch {
-    Die "the test request to the qBraid gateway failed: $_"
+    # Everything is installed by this point; the commonest cause is an empty
+    # wallet, which is not a broken setup.
+    Warn "could not verify the gateway: $($_.Exception.Message)"
+    Warn 'Everything is installed. Run `qbraid-code --doctor` to check again.'
 }
-if (-not (Get-Prop $reply 'content')) { Die "unexpected reply from the gateway: $($reply | ConvertTo-Json -Compress)" }
-Ok 'end-to-end request succeeded'
 
 # ---------------------------------------------------------------- 12. finish
 

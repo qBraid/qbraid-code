@@ -7,13 +7,17 @@
   stdin. It must never block: the credit balance is served from a short-lived
   cache and refreshed in a detached process, so a slow network costs nothing.
 #>
-# No Set-StrictMode here on purpose: it prohibits references to non-existent
-# properties, and a session payload that omits `model` or `context_window`
-# would then throw on every keystroke. This script must always render something.
+# Get-Nested probes PSObject.Properties rather than dereferencing, so StrictMode
+# is safe here and is enabled for consistency with install.ps1 and doctor.ps1.
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
 
 $HomeDir = if ($env:QBRAID_CODE_HOME) { $env:QBRAID_CODE_HOME } else { Join-Path $env:USERPROFILE '.qbraid-code' }
 $Cache   = Join-Path $HomeDir 'credits.cache'
+# Stamped before each refresh ATTEMPT, not after a success. Without it a failing
+# balance call leaves the cache untouched, so every render decides a refresh is
+# due and starts another powershell.exe — several a second, all session.
+$Attempt = Join-Path $HomeDir 'credits.attempt'
 $Ttl     = 60
 
 $apiBase = 'https://api-v2.qbraid.com/api/v1'
@@ -88,24 +92,42 @@ if ($null -ne $remaining) {
 
 function Start-CreditRefresh {
     if (-not $token) { return }
-    $script = @"
-`$b = Invoke-RestMethod -Uri '$apiBase/billing/credits/balance' -Headers @{ 'X-API-Key' = '$token' } -TimeoutSec 15
-if (`$b.data.qbraidCredits -ne `$null) {
-  Set-Content -Path '$Cache' -Value ([string]`$b.data.qbraidCredits) -Encoding ASCII
+    # Stamp first: a refresh that fails must still back off for $Ttl seconds.
+    Set-Content -Path $Attempt -Value ([string](Get-Date -UFormat %s)) -Encoding ASCII
+
+    # The child reads the credential out of the env file itself. Passing it in
+    # -ArgumentList would put a live API key on a process command line, which
+    # every user on the machine can read from the process list.
+    $envFile = Join-Path $HomeDir 'env'
+    $script = @'
+$home_dir = $env:QC_ENV_FILE
+$base = ''; $tok = ''
+foreach ($line in Get-Content $home_dir) {
+  if ($line -match '^\s*QBRAID_CODE_API_BASE\s*=\s*(.*)$') { $base = $Matches[1] }
+  if ($line -match '^\s*QBRAID_CODE_TOKEN\s*=\s*(.*)$')    { $tok  = $Matches[1] }
 }
-"@
+if (-not $tok) { exit }
+try {
+  $b = Invoke-RestMethod -Uri "$base/billing/credits/balance" -Headers @{ 'X-API-Key' = $tok } -TimeoutSec 15
+  if ($null -ne $b.data.qbraidCredits) {
+    Set-Content -Path $env:QC_CACHE -Value ([string]$b.data.qbraidCredits) -Encoding ASCII
+  }
+} catch { }
+'@
+    $env:QC_ENV_FILE = $envFile
+    $env:QC_CACHE    = $Cache
     Start-Process -FilePath 'powershell' -WindowStyle Hidden `
         -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $script
 }
 
 $credits = $null
-if (Test-Path $Cache) {
-    $credits = (Get-Content $Cache -Raw).Trim()
-    $age = ((Get-Date) - (Get-Item $Cache).LastWriteTime).TotalSeconds
-    if ($age -ge $Ttl) { Start-CreditRefresh }
-} else {
-    Start-CreditRefresh
+if (Test-Path $Cache) { $credits = (Get-Content $Cache -Raw).Trim() }
+
+$due = $true
+if (Test-Path $Attempt) {
+    $due = ((Get-Date) - (Get-Item $Attempt).LastWriteTime).TotalSeconds -ge $Ttl
 }
+if ($due) { Start-CreditRefresh }
 
 $creditSeg = ''
 if ($credits) {

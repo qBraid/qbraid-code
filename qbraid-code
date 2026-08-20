@@ -1,24 +1,35 @@
 #!/usr/bin/env bash
 # qbraid-code — Claude Code, powered by the qBraid AI gateway.
 # Installed by install.sh; reads its settings from ~/.qbraid-code/env.
+#
+# The installer rewrites the HOME_DIR line below to the directory it actually
+# installed into, so a non-default QBRAID_CODE_HOME keeps working in a fresh
+# shell that never set the variable.
 set -euo pipefail
 
 HOME_DIR="${QBRAID_CODE_HOME:-$HOME/.qbraid-code}"
-[ -f "$HOME_DIR/env" ] || {
+if [ ! -f "$HOME_DIR/env" ]; then
   echo "qbraid-code: not installed — no $HOME_DIR/env" >&2
   echo "Install it with: curl -fsSL https://qbraid.com/code.sh | bash" >&2
   exit 1
-}
+fi
 # shellcheck disable=SC1091
 . "$HOME_DIR/env"
 
-BASE_URL="$QBRAID_CODE_BASE_URL"
-API_BASE="$QBRAID_CODE_API_BASE"
-TOKEN="$QBRAID_CODE_TOKEN"
-MODEL="$QBRAID_CODE_MODEL"
+# Defaulted rather than required, so a truncated env file produces a diagnosis
+# from --doctor instead of an unbound-variable crash before the dispatch runs.
+BASE_URL="${QBRAID_CODE_BASE_URL:-}"
+API_BASE="${QBRAID_CODE_API_BASE:-}"
+TOKEN="${QBRAID_CODE_TOKEN:-}"
+MODEL="${QBRAID_CODE_MODEL:-}"
 
-balance() {
-  curl -fsS -m 20 "$API_BASE/billing/credits/balance" -H "X-API-Key: $TOKEN"
+missing_keys() {
+  local missing=""
+  [ -n "$BASE_URL" ] || missing="$missing QBRAID_CODE_BASE_URL"
+  [ -n "$API_BASE" ] || missing="$missing QBRAID_CODE_API_BASE"
+  [ -n "$TOKEN" ]    || missing="$missing QBRAID_CODE_TOKEN"
+  [ -n "$MODEL" ]    || missing="$missing QBRAID_CODE_MODEL"
+  printf '%s' "$missing"
 }
 
 case "${1:-}" in
@@ -27,16 +38,48 @@ case "${1:-}" in
       && echo "claude:   $(claude --version 2>/dev/null || echo present)" \
       || echo "claude:   NOT INSTALLED"
 
-    if BODY=$(balance 2>/dev/null); then
-      CREDITS=$(printf '%s' "$BODY" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
-      echo "key:      valid"
-      echo "credits:  ${CREDITS:-unknown}"
+    MISSING=$(missing_keys)
+    if [ -n "$MISSING" ]; then
+      echo "config:   INCOMPLETE — missing:$MISSING"
+      echo "          re-run: curl -fsSL https://qbraid.com/code.sh | bash"
     else
-      echo "key:      REJECTED — make a new one at https://account.qbraid.com/account/api-keys"
+      echo "config:   $HOME_DIR/env"
+    fi
+
+    if [ -n "$TOKEN" ] && [ -n "$API_BASE" ]; then
+      TMP=$(mktemp)
+      # Separate transport failure from rejection. Reporting "REJECTED" for a
+      # dropped connection sent people off to make a new key for no reason.
+      STATUS=$(curl -sS -m 20 -o "$TMP" -w '%{http_code}' \
+        "$API_BASE/billing/credits/balance" -H "X-API-Key: $TOKEN" 2>/dev/null) || STATUS="000"
+      BODY=$(cat "$TMP"); rm -f "$TMP"
+      case "$STATUS" in
+        200)
+          RAW=$(printf '%s' "$BODY" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
+          CREDITS=$(awk -v c="$RAW" 'BEGIN { printf "%.0f", c }' 2>/dev/null) || CREDITS="$RAW"
+          echo "key:      valid"
+          echo "credits:  ${CREDITS:-unknown}"
+          ;;
+        401|403)
+          echo "key:      REJECTED — make a new one at https://account.qbraid.com/account/api-keys"
+          echo "credits:  unknown"
+          ;;
+        000)
+          echo "key:      UNKNOWN — could not reach qBraid (check your connection)"
+          echo "credits:  unknown"
+          ;;
+        *)
+          echo "key:      UNKNOWN — qBraid returned HTTP $STATUS"
+          echo "credits:  unknown"
+          ;;
+      esac
+    else
+      echo "key:      not configured"
       echo "credits:  unknown"
     fi
 
-    if curl -fsS -m 20 -o /dev/null "$BASE_URL/v1/models" -H "X-API-Key: $TOKEN" 2>/dev/null; then
+    if [ -n "$BASE_URL" ] \
+      && curl -fsS -m 20 -o /dev/null "$BASE_URL/v1/models" -H "X-API-Key: $TOKEN" 2>/dev/null; then
       echo "gateway:  reachable"
     else
       echo "gateway:  UNREACHABLE"
@@ -48,7 +91,7 @@ case "${1:-}" in
       echo "mcp:      NOT REGISTERED"
     fi
 
-    echo "model:    $MODEL"
+    echo "model:    ${MODEL:-not set}"
     exit 0 ;;
   --help|-h)
     cat <<EOF
@@ -61,11 +104,18 @@ qbraid-code — Claude Code, powered by the qBraid AI gateway.
 Any other arguments are passed straight through to \`claude\`, so
 \`-c\`, \`--allowedTools\`, \`--model\`, and the rest behave normally.
 
-Default model: $MODEL
+Default model: ${MODEL:-not set}
 Change it by editing $HOME_DIR/env, or pass --model.
 EOF
     exit 0 ;;
 esac
+
+MISSING=$(missing_keys)
+if [ -n "$MISSING" ]; then
+  echo "qbraid-code: $HOME_DIR/env is incomplete — missing:$MISSING" >&2
+  echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
+  exit 1
+fi
 
 command -v claude >/dev/null 2>&1 || {
   echo "qbraid-code: Claude Code is not installed." >&2
@@ -74,10 +124,9 @@ command -v claude >/dev/null 2>&1 || {
 }
 
 # ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which the gateway
-# accepts (qbraid-api apikey-strategy.service.ts claims `Bearer qbr_...`).
-# ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the user to
-# approve a custom API key on first run — a prompt with no good answer for
-# someone who just wants to start working.
+# accepts. ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the
+# user to approve a custom API key on first run — a prompt with no good answer
+# for someone who just wants to start working.
 ANTHROPIC_BASE_URL="$BASE_URL" \
 ANTHROPIC_AUTH_TOKEN="$TOKEN" \
 ANTHROPIC_MODEL="$MODEL" \

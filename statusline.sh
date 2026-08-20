@@ -8,6 +8,11 @@ set -uo pipefail
 
 HOME_DIR="${QBRAID_CODE_HOME:-$HOME/.qbraid-code}"
 CACHE="$HOME_DIR/credits.cache"
+# Stamped before each refresh ATTEMPT, not after a success. Without it a
+# failing balance call (revoked key, no network) leaves the cache untouched,
+# so every render decides a refresh is due and spawns another background
+# curl — several per second, for the whole session.
+ATTEMPT="$HOME_DIR/credits.attempt"
 TTL=60
 
 [ -f "$HOME_DIR/env" ] && . "$HOME_DIR/env"
@@ -62,9 +67,23 @@ fi
 
 # ----------------------------------------------------------------- credits
 
+# `stat -f %m` is BSD. On GNU coreutils `-f` means --file-system, so the
+# command FAILS but still prints a filesystem block to stdout — the exit
+# status alone does not tell you it went wrong. Try the GNU form first and
+# reject any answer that is not a plain integer.
+file_age() { # file_age <path> — seconds since last modification
+  local mtime=""
+  mtime=$(stat -c %Y "$1" 2>/dev/null) || mtime=$(stat -f %m "$1" 2>/dev/null) || return 1
+  case "$mtime" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  echo $(( $(date +%s) - mtime ))
+}
+
 # Refresh out of band so the prompt never waits on the network.
 refresh_credits() {
   [ -n "$TOKEN" ] || return 0
+  : > "$ATTEMPT" 2>/dev/null || return 0
   (
     body=$(curl -fsS -m 15 "$API_BASE/billing/credits/balance" -H "X-API-Key: $TOKEN" 2>/dev/null) || exit 0
     value=$(printf '%s' "$body" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
@@ -73,18 +92,11 @@ refresh_credits() {
   ) >/dev/null 2>&1 &
 }
 
-file_age() { # file_age <path> — seconds since last modification
-  local mtime
-  mtime=$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || return 1
-  echo $(( $(date +%s) - mtime ))
-}
-
 credits=""
-if [ -s "$CACHE" ]; then
-  credits=$(cat "$CACHE" 2>/dev/null)
-  age=$(file_age "$CACHE" 2>/dev/null || echo "$((TTL + 1))")
-  [ "$age" -ge "$TTL" ] && refresh_credits
-else
+[ -s "$CACHE" ] && credits=$(cat "$CACHE" 2>/dev/null)
+
+age=$(file_age "$ATTEMPT" 2>/dev/null) || age=""
+if [ -z "$age" ] || [ "$age" -ge "$TTL" ]; then
   refresh_credits
 fi
 
@@ -104,4 +116,7 @@ sep="${dim} │ ${rst}"
 out="$place${sep}${dim}${model}${rst}"
 [ -n "$bar" ] && out="${out}${sep}${bar}"
 [ -n "$credit_seg" ] && out="${out}${sep}${credit_seg}"
-printf '%b\n' "$out"
+# %s, not %b: the directory name comes from the session payload and must not
+# have backslash escapes re-interpreted into terminal control sequences. The
+# colours above are already literal ESC bytes and are unaffected.
+printf '%s\n' "$out"
