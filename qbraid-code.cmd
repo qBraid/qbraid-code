@@ -50,6 +50,11 @@ rem ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which the gateway
 rem accepts. ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the
 rem user to approve a custom API key on first run - a prompt with no good answer
 rem for someone who just wants to start working.
+rem MAX_THINKING_TOKENS=0: recent Claude Code sends thinking type "adaptive",
+rem which the gateway rejects (accepts enabled/disabled only) - every request
+rem would 400. Forced: an inherited value re-enables thinking and breaks every
+rem request. Remove once the gateway accepts adaptive.
+set "MAX_THINKING_TOKENS=0"
 set "ANTHROPIC_BASE_URL=%QBRAID_CODE_BASE_URL%"
 set "ANTHROPIC_AUTH_TOKEN=%QBRAID_CODE_TOKEN%"
 set "ANTHROPIC_MODEL=%QBRAID_CODE_MODEL%"
