@@ -1,0 +1,8 @@
+# cmd.exe requires CRLF: an LF-only .cmd mis-parses `if`/`goto` blocks.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Everything a POSIX shell runs must stay LF, whatever the checkout platform.
+*.sh      text eol=lf
+install.sh text eol=lf
+qbraid-code text eol=lf
