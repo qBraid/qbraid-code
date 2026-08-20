@@ -65,20 +65,22 @@ check "credits are rounded"  "$FULL" '4281 credits'
 # forever. With a fresh attempt stamp no refresh is due; if file_age is broken
 # the script cannot tell, so assert it reads back a sane age.
 : > "$TMP/credits.attempt"
-age_probe=$(
-  # shellcheck disable=SC1090
-  mtime=$(stat -c %Y "$TMP/credits.attempt" 2>/dev/null) \
-    || mtime=$(stat -f %m "$TMP/credits.attempt" 2>/dev/null) \
-    || mtime=""
-  case "$mtime" in
-    ''|*[!0-9]*) echo "BAD" ;;
-    *) echo $(( $(date +%s) - mtime )) ;;
+# Defined as a function, not inlined into $( ): bash 3.2 (which macOS still
+# ships) cannot parse `case ... esac` inside a command substitution.
+probe_mtime() {
+  local m=""
+  m=$(stat -c %Y "$1" 2>/dev/null) || m=$(stat -f %m "$1" 2>/dev/null) || return 1
+  [ -n "$m" ] || return 1
+  case "$m" in
+    *[!0-9]*) return 1 ;;
   esac
-)
-if [ "$age_probe" != BAD ] && [ "$age_probe" -lt 5 ] 2>/dev/null; then
+  echo $(( $(date +%s) - m ))
+}
+
+if age_probe=$(probe_mtime "$TMP/credits.attempt") && [ "$age_probe" -lt 5 ]; then
   pass=$((pass + 1)); printf '  ok   file mtime readable on %s (age %ss)\n' "$(uname -s)" "$age_probe"
 else
-  fail=$((fail + 1)); printf '  FAIL file mtime unreadable on %s: %s\n' "$(uname -s)" "$age_probe"
+  fail=$((fail + 1)); printf '  FAIL file mtime unreadable on %s\n' "$(uname -s)"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
