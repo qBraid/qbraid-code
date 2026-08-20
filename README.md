@@ -32,21 +32,6 @@ That is all. The installer:
 
 Re-running it is safe.
 
-> **While this repository is private**, neither `qbraid.com/code.sh` nor
-> `qbraid.com/code.ps1` is live yet. Use the GitHub CLI instead (`gh auth login`
-> first, and you must be in the `qBraid` org):
->
-> ```bash
-> # macOS and Linux
-> gh api -H "Accept: application/vnd.github.raw" \
->   /repos/qBraid/qbraid-code/contents/install.sh | bash
-> ```
->
-> ```powershell
-> # Windows
-> gh api -H "Accept: application/vnd.github.raw" /repos/qBraid/qbraid-code/contents/install.ps1 | Out-String | iex
-> ```
-
 ## Use
 
 ```bash
