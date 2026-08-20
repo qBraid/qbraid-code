@@ -158,8 +158,22 @@ fi
 
 # ------------------------------------------------------------- 3. credential
 
-json_str() { # json_str <blob> <key>
-  printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed "s/\"$2\":\"//; s/\"$//"
+# `set -o pipefail` is on, so a grep that matches NOTHING makes the whole
+# pipeline non-zero, and `set -e` then kills the installer with no message at
+# all. An absent field is a normal outcome here (an error body has no `name`),
+# not an error, so pipefail is disabled inside the extracting subshell.
+json_str() { # json_str <blob> <key> -> the value, or empty
+  (
+    set +o pipefail
+    printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed "s/\"$2\":\"//; s/\"$//"
+  )
+}
+
+json_num() { # json_num <blob> <key> -> the value, or empty
+  (
+    set +o pipefail
+    printf '%s' "$1" | grep -o "\"$2\":-\?[0-9.]*" | head -1 | sed 's/.*://'
+  )
 }
 
 HTTP_STATUS=""
@@ -167,12 +181,17 @@ API_BODY=""
 # Sets API_BODY and HTTP_STATUS in the CALLER (000 = could not connect).
 # It must not print the body: `x=$(api_get ...)` would run this in a subshell
 # and the status would never make it back, so every failure read as "rejected".
-api_get() { # api_get <url> <key>
-  local url="$1" key="$2" tmp
+api_get() { # api_get <url> <key> [org-id]
+  local url="$1" key="$2" org="${3:-}" tmp
   API_BODY=""
   tmp=$(mktemp) || { HTTP_STATUS="000"; return 0; }
-  HTTP_STATUS=$(curl -sS -m 25 -o "$tmp" -w '%{http_code}' "$url" -H "X-API-Key: $key" 2>/dev/null) \
-    || HTTP_STATUS="000"
+  if [ -n "$org" ]; then
+    HTTP_STATUS=$(curl -sS -m 25 -o "$tmp" -w '%{http_code}' "$url" \
+      -H "X-API-Key: $key" -H "X-Organization-Id: $org" 2>/dev/null) || HTTP_STATUS="000"
+  else
+    HTTP_STATUS=$(curl -sS -m 25 -o "$tmp" -w '%{http_code}' "$url" \
+      -H "X-API-Key: $key" 2>/dev/null) || HTTP_STATUS="000"
+  fi
   API_BODY=$(cat "$tmp")
   rm -f "$tmp"
 }
@@ -265,7 +284,7 @@ esac
 # ------------------------------------------------------- 4. organization check
 
 ORG_ID=$(json_str "$BALANCE" organizationId)
-CREDITS_RAW=$(printf '%s' "$BALANCE" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
+CREDITS_RAW=$(json_num "$BALANCE" qbraidCredits)
 if [ -n "$CREDITS_RAW" ]; then
   CREDITS=$(awk -v c="$CREDITS_RAW" 'BEGIN { printf "%.0f", c }' 2>/dev/null) || CREDITS="$CREDITS_RAW"
 else
@@ -279,7 +298,7 @@ fi
 # alongside so a bad parse cannot quietly point someone at the wrong org.
 ORG_NAME=""
 if [ -n "$ORG_ID" ]; then
-  api_get "$API_BASE/organizations/current" "$API_KEY"
+  api_get "$API_BASE/organizations/current" "$API_KEY" "$ORG_ID"
   ORG_DATA=$(printf '%s' "$API_BODY" | sed 's/.*"data"[[:space:]]*:[[:space:]]*{//')
   ORG_NAME=$(json_str "$ORG_DATA" name)
 fi
@@ -314,7 +333,7 @@ MODEL="${QBRAID_CODE_MODEL:-}"
 if [ -z "$MODEL" ]; then
   # The list is fetched live so new gateway models appear without a release here.
   api_get "$GATEWAY_URL/v1/models" "$API_KEY"
-  MODEL_IDS=$(printf '%s' "$API_BODY" | grep -o '"id":"[^"]*"' | sed 's/"id":"//; s/"$//')
+  MODEL_IDS=$(set +o pipefail; printf '%s' "$API_BODY" | grep -o '"id":"[^"]*"' | sed 's/"id":"//; s/"$//')
   if [ -z "$MODEL_IDS" ]; then
     warn "could not list models — defaulting to claude-sonnet-4-6"
     MODEL="claude-sonnet-4-6"
