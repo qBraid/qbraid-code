@@ -364,6 +364,10 @@ QBRAID_CODE_MODEL=$MODEL
 EOF
 chmod 600 "$HOME_DIR/env"
 umask "$OLD_UMASK"
+# The cached balance belongs to whichever key was configured before. Re-running
+# with a key from a different organization must not keep rendering the old
+# organization's wallet.
+rm -f "$HOME_DIR/credits.cache" "$HOME_DIR/credits.attempt"
 ok "config written to $HOME_DIR/env"
 
 # ------------------------------------------------- 7. launcher and statusline

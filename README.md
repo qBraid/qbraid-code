@@ -143,6 +143,21 @@ Line Tools on macOS, or no `python3` on Linux) and `~/.claude/settings.json`
 already exists, the installer cannot merge JSON safely and skips this step. It
 prints the snippet to add by hand.
 
+## Trust
+
+The installer is served from `qbraid.com` but its source of truth is the `main`
+branch of this repository, fetched at request time with no pin and no signature.
+Anyone who can push here can change what a `curl | bash` runs, which is the
+normal trade-off for a one-line installer that must stay current. Two things
+follow from that: branch protection on `main` is load-bearing, and if you would
+rather read before you run, fetch the script and inspect it first:
+
+```bash
+curl -fsSL https://qbraid.com/code.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
 ## Uninstall
 
 ```bash
