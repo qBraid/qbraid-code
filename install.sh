@@ -481,7 +481,8 @@ write_settings() {
     "ANTHROPIC_BASE_URL": "$GATEWAY_URL",
     "ANTHROPIC_AUTH_TOKEN": "$API_KEY",
     "ANTHROPIC_MODEL": "$MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL": "$MODEL"
+    "ANTHROPIC_SMALL_FAST_MODEL": "$MODEL",
+    "MAX_THINKING_TOKENS": "0"
   },
   "statusLine": { "type": "command", "command": "'$statusline_cmd'" }
 }
@@ -510,6 +511,9 @@ if os.environ["QC_GLOBAL"] == "1":
     env["ANTHROPIC_AUTH_TOKEN"] = os.environ["QC_TOKEN"]
     env["ANTHROPIC_MODEL"] = os.environ["QC_MODEL"]
     env["ANTHROPIC_SMALL_FAST_MODEL"] = os.environ["QC_MODEL"]
+    # The gateway rejects Claude Code's adaptive-thinking parameter; see the
+    # launcher for the full note. Remove when the gateway accepts "adaptive".
+    env["MAX_THINKING_TOKENS"] = "0"
 tmp = path + ".qbraid-code.tmp"
 with open(tmp, "w") as fh:
     json.dump(data, fh, indent=2)

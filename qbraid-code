@@ -128,6 +128,14 @@ command -v claude >/dev/null 2>&1 || {
 # accepts. ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the
 # user to approve a custom API key on first run — a prompt with no good answer
 # for someone who just wants to start working.
+#
+# MAX_THINKING_TOKENS=0: recent Claude Code sends `thinking: {type: "adaptive"}`,
+# which the gateway's Anthropic surface rejects (it accepts enabled|disabled —
+# qbraid-api ai-request.validators.ts), turning every request into a 400.
+# FORCED, not defaulted: an inherited MAX_THINKING_TOKENS from the user's
+# shell re-enables thinking and turns every request into that 400. Remove the
+# whole line once the gateway accepts "adaptive".
+MAX_THINKING_TOKENS=0 \
 ANTHROPIC_BASE_URL="$BASE_URL" \
 ANTHROPIC_AUTH_TOKEN="$TOKEN" \
 ANTHROPIC_MODEL="$MODEL" \

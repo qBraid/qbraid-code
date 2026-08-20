@@ -357,6 +357,9 @@ if ($Global) {
     $envObj | Add-Member -NotePropertyName ANTHROPIC_AUTH_TOKEN       -NotePropertyValue $ApiKey     -Force
     $envObj | Add-Member -NotePropertyName ANTHROPIC_MODEL            -NotePropertyValue $Model      -Force
     $envObj | Add-Member -NotePropertyName ANTHROPIC_SMALL_FAST_MODEL -NotePropertyValue $Model      -Force
+    # The gateway rejects Claude Code's adaptive-thinking parameter; see the
+    # launcher for the full note. Remove when the gateway accepts "adaptive".
+    $envObj | Add-Member -NotePropertyName MAX_THINKING_TOKENS         -NotePropertyValue '0'        -Force
     $cfg | Add-Member -NotePropertyName env -NotePropertyValue $envObj -Force
 }
 Write-RawText $Settings ($cfg | ConvertTo-Json -Depth 100)
