@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# qbraid-code — Claude Code, powered by the qBraid AI gateway.
+# Installed by install.sh; reads its settings from ~/.qbraid-code/env.
+set -euo pipefail
+
+HOME_DIR="${QBRAID_CODE_HOME:-$HOME/.qbraid-code}"
+[ -f "$HOME_DIR/env" ] || {
+  echo "qbraid-code: not installed — no $HOME_DIR/env" >&2
+  echo "Install it with: curl -fsSL https://qbraid.com/code.sh | bash" >&2
+  exit 1
+}
+# shellcheck disable=SC1091
+. "$HOME_DIR/env"
+
+BASE_URL="$QBRAID_CODE_BASE_URL"
+API_BASE="$QBRAID_CODE_API_BASE"
+TOKEN="$QBRAID_CODE_TOKEN"
+MODEL="$QBRAID_CODE_MODEL"
+
+balance() {
+  curl -fsS -m 20 "$API_BASE/billing/credits/balance" -H "X-API-Key: $TOKEN"
+}
+
+case "${1:-}" in
+  --doctor)
+    command -v claude >/dev/null 2>&1 \
+      && echo "claude:   $(claude --version 2>/dev/null || echo present)" \
+      || echo "claude:   NOT INSTALLED"
+
+    if BODY=$(balance 2>/dev/null); then
+      CREDITS=$(printf '%s' "$BODY" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
+      echo "key:      valid"
+      echo "credits:  ${CREDITS:-unknown}"
+    else
+      echo "key:      REJECTED — make a new one at https://account.qbraid.com/account/api-keys"
+      echo "credits:  unknown"
+    fi
+
+    if curl -fsS -m 20 -o /dev/null "$BASE_URL/v1/models" -H "X-API-Key: $TOKEN" 2>/dev/null; then
+      echo "gateway:  reachable"
+    else
+      echo "gateway:  UNREACHABLE"
+    fi
+
+    if claude mcp get qbraid >/dev/null 2>&1; then
+      echo "mcp:      registered (run 'claude mcp login qbraid' if tools are missing)"
+    else
+      echo "mcp:      NOT REGISTERED"
+    fi
+
+    echo "model:    $MODEL"
+    exit 0 ;;
+  --help|-h)
+    cat <<EOF
+qbraid-code — Claude Code, powered by the qBraid AI gateway.
+
+  qbraid-code [claude args...]   start a session
+  qbraid-code -p "..."           ask one question and exit
+  qbraid-code --doctor           check your setup
+
+Any other arguments are passed straight through to \`claude\`, so
+\`-c\`, \`--allowedTools\`, \`--model\`, and the rest behave normally.
+
+Default model: $MODEL
+Change it by editing $HOME_DIR/env, or pass --model.
+EOF
+    exit 0 ;;
+esac
+
+command -v claude >/dev/null 2>&1 || {
+  echo "qbraid-code: Claude Code is not installed." >&2
+  echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
+  exit 1
+}
+
+# ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which the gateway
+# accepts (qbraid-api apikey-strategy.service.ts claims `Bearer qbr_...`).
+# ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the user to
+# approve a custom API key on first run — a prompt with no good answer for
+# someone who just wants to start working.
+ANTHROPIC_BASE_URL="$BASE_URL" \
+ANTHROPIC_AUTH_TOKEN="$TOKEN" \
+ANTHROPIC_MODEL="$MODEL" \
+ANTHROPIC_SMALL_FAST_MODEL="$MODEL" \
+CLAUDE_CODE_SUBAGENT_MODEL="$MODEL" \
+exec claude "$@"
