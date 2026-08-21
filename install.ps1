@@ -386,6 +386,10 @@ if ($ProxyBin) {
         $yaml += '  allow-remote: false'
         $yaml += '  disable-control-panel: true'
         $yaml += 'debug: false'
+        $yaml += '# Model-list cloaking would rewrite ids into reversed pseudo-claude names;'
+        $yaml += '# our anthropic-compat/ aliases pass the picker filter with readable names.'
+        $yaml += 'claude-code:'
+        $yaml += '  disable-cloaking-model-list: true'
         $yaml += 'claude-api-key:'
         $yaml += "  - api-key: `"$ApiKey`""
         $yaml += "    base-url: `"$GatewayUrl`""
@@ -401,8 +405,12 @@ if ($ProxyBin) {
         $yaml += "      - api-key: `"$ApiKey`""
         $yaml += '    models:'
         foreach ($gm in $gptModels) {
+            # Plain alias for the command line, prefixed alias so the /model
+            # picker's discovery filter (claude|anthropic substring) shows it.
             $yaml += "      - name: `"$gm`""
             $yaml += "        alias: `"$gm`""
+            $yaml += "      - name: `"$gm`""
+            $yaml += "        alias: `"anthropic-compat/$gm`""
         }
         Write-RawText (Join-Path $HomeDir 'proxy-config.yaml') (($yaml -join "`n") + "`n")
         New-Item -ItemType Directory -Force -Path (Join-Path $HomeDir 'proxy-auth') | Out-Null

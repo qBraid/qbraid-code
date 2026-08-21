@@ -63,6 +63,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1"
 if errorlevel 1 goto :noproxy
 set /p RUNTOKEN=<"%QC_HOME%\proxy.key"
 set "RUNBASE=http://127.0.0.1:8320"
+rem Populate the /model picker from the proxy's model list at startup.
+set "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1"
 goto :routed
 :noproxy
 if /i "%RUNMODEL:~0,4%"=="gpt-" (
