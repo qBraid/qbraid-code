@@ -490,6 +490,11 @@ if [ -n "$PROXY_BIN" ]; then
       umask "$OLD_UMASK"
     fi
     PROXY_LOCAL_KEY=$(cat "$HOME_DIR/proxy.key")
+    # One proxy, every model: Claude models pass through to the Anthropic
+    # surface untouched (claude-api-key with a custom base-url), GPT models are
+    # translated to the OpenAI surface. The proxy's /v1/models then lists all
+    # of them, and one base URL serves any `--model`.
+    CLAUDE_MODELS=$(set +o pipefail; printf '%s' "$API_BODY" | grep -o '"id":"claude-[^"]*"' | sed 's/"id":"//; s/"$//')
     OLD_UMASK=$(umask); umask 077
     {
       cat <<PEOF
@@ -505,14 +510,25 @@ remote-management:
   allow-remote: false
   disable-control-panel: true
 debug: false
+claude-api-key:
+  - api-key: "$API_KEY"
+    base-url: "$GATEWAY_URL"
+    models:
+PEOF
+      printf '%s\n' "$CLAUDE_MODELS" | while IFS= read -r cm; do
+        [ -n "$cm" ] || continue
+        printf '      - name: "%s"\n        alias: "%s"\n' "$cm" "$cm"
+      done
+      cat <<PEOF
 openai-compatibility:
-  - name: "qbraid-gateway"
+  - name: "qbraid-gateway-gpt"
     base-url: "$GATEWAY_URL"
     api-key-entries:
       - api-key: "$API_KEY"
     models:
 PEOF
       printf '%s\n' "$GPT_MODELS" | while IFS= read -r gm; do
+        [ -n "$gm" ] || continue
         printf '      - name: "%s"\n        alias: "%s"\n' "$gm" "$gm"
       done
     } > "$HOME_DIR/proxy-config.yaml"
@@ -520,7 +536,8 @@ PEOF
     umask "$OLD_UMASK"
     mkdir -p "$HOME_DIR/proxy-auth"
     GPT_COUNT=$(printf '%s\n' "$GPT_MODELS" | wc -l | tr -d ' ')
-    ok "proxy configured for $GPT_COUNT GPT models (starts on demand)"
+    CLAUDE_COUNT=$(printf '%s\n' "$CLAUDE_MODELS" | wc -l | tr -d ' ')
+    ok "proxy configured: all $((GPT_COUNT + CLAUDE_COUNT)) models on one endpoint (starts on demand)"
   fi
 else
   warn "CLIProxyAPI unavailable — GPT models will not work; Claude models are unaffected."

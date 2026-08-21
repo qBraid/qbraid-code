@@ -52,14 +52,18 @@ qbraid-code --model gpt-5.6-sol
 qbraid-code --model gpt-5.4-mini -p "explain this error"
 ```
 
-Claude Code speaks the Anthropic API and the gateway serves GPT only on its
-OpenAI-compatible surface, so the first GPT request starts a small local
-translation proxy (CLIProxyAPI, loopback only, installed by the installer).
-Claude models never touch it. `qbraid-code --stop` shuts it down.
+Every model — Claude and GPT — is served through one local endpoint: a small
+translation proxy (CLIProxyAPI, loopback only, started on demand). Claude
+models pass through to the gateway untouched; GPT models are translated to its
+OpenAI-compatible surface. Because it is one endpoint, `/model <name>` works
+for **any** of the models mid-session, e.g. `/model gpt-5.6-sol`.
 
-Two caveats: GPT models accept at most 128 tools, so with many MCP servers
-add `--strict-mcp-config`; and the `/model` picker inside a session lists
-Claude models only — choose a GPT model at launch with `--model`.
+If the proxy is missing, Claude models automatically fall back to the gateway
+directly — they can never break because of it. `qbraid-code --stop` shuts the
+proxy down.
+
+One caveat: GPT models accept at most 128 tools, so with many MCP servers add
+`--strict-mcp-config`.
 
 A session looks like this:
 
