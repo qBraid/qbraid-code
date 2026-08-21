@@ -7,82 +7,288 @@
 # shell that never set the variable.
 set -euo pipefail
 
-HOME_DIR="${QBRAID_CODE_HOME:-$HOME/.qbraid-code}"
-if [ ! -f "$HOME_DIR/env" ]; then
-  echo "qbraid-code: not installed — no $HOME_DIR/env" >&2
-  echo "Install it with: curl -fsSL https://qbraid.com/code.sh | bash" >&2
-  exit 1
-fi
-# shellcheck disable=SC1091
-. "$HOME_DIR/env"
-
-# Defaulted rather than required, so a truncated env file produces a diagnosis
-# from --doctor instead of an unbound-variable crash before the dispatch runs.
-BASE_URL="${QBRAID_CODE_BASE_URL:-}"
-API_BASE="${QBRAID_CODE_API_BASE:-}"
-TOKEN="${QBRAID_CODE_TOKEN:-}"
-MODEL="${QBRAID_CODE_MODEL:-}"
-PROXY_PORT="${QBRAID_CODE_PROXY_PORT:-8320}"
-PROXY_BIN="${QBRAID_CODE_PROXY_BIN:-}"
-PROXY_URL="http://127.0.0.1:$PROXY_PORT"
 CLAUDE_MIN_VERSION="2.1.186"
 CLAUDE_TESTED_MAX="2.1.238"
 
-# ---------------------------------------------------------------- GPT proxy
-# The gateway serves GPT models only on its OpenAI-compat surface, which
-# Claude Code cannot speak. A loopback CLIProxyAPI translates; it is started
-# here on demand and only when a gpt-* model is actually requested.
+HOME_DIR="${QBRAID_CODE_HOME:-}"
+if [ -z "$HOME_DIR" ] && [ -f "${BASH_SOURCE[0]}.home" ]; then
+  IFS= read -r HOME_DIR < "${BASH_SOURCE[0]}.home" || true
+fi
+[ -n "$HOME_DIR" ] || HOME_DIR="$HOME/.qbraid-code"
+if [ -e "$HOME_DIR/profiles/default" ]; then
+  if [ -f "$HOME_DIR/env" ] && grep -q '^QBRAID_CODE_TOKEN=' "$HOME_DIR/env"; then { grep -v '^QBRAID_CODE_TOKEN=' "$HOME_DIR/env" || true; } > "$HOME_DIR/env.clean.$$"; chmod 600 "$HOME_DIR/env.clean.$$"; mv "$HOME_DIR/env.clean.$$" "$HOME_DIR/env"; fi
+  legacy_pid=$(cat "$HOME_DIR/proxy.pid" 2>/dev/null || true); legacy_command=""; keep_legacy_config=0
+  if [ -n "$legacy_pid" ] && kill -0 "$legacy_pid" 2>/dev/null; then
+    keep_legacy_config=1
+    if [ -r "/proc/$legacy_pid/cmdline" ]; then legacy_command=$(tr '\000' ' ' < "/proc/$legacy_pid/cmdline" 2>/dev/null || true); elif command -v ps >/dev/null 2>&1; then legacy_command=$(ps -p "$legacy_pid" -o command= 2>/dev/null || true); fi
+    case "$legacy_command" in '') ;; *"$HOME_DIR/proxy-config.yaml"*) ;; *) keep_legacy_config=0 ;; esac
+  fi
+  [ "$keep_legacy_config" -eq 1 ] || rm -f "$HOME_DIR/proxy-config.yaml"
+fi
+for stale_session in "$HOME_DIR"/session.*; do
+  [ -d "$stale_session" ] || continue
+  stale_owner=$(cat "$stale_session/owner.pid" 2>/dev/null || true)
+  if [ -z "$stale_owner" ] || ! kill -0 "$stale_owner" 2>/dev/null; then rm -rf "$stale_session"; fi
+done
 
-proxy_listening() {
-  [ -s "$HOME_DIR/proxy.key" ] || return 1
-  curl -fs -m 3 -o /dev/null "$PROXY_URL/v1/models" \
-    -H "Authorization: Bearer $(cat "$HOME_DIR/proxy.key")" 2>/dev/null
+valid_profile_slug() {
+  local LC_ALL=C
+  case "${1:-}" in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${#1}" -le 32 ]
 }
 
-PROXY_STARTED_BY_US=0
+profile_dir() {
+  local root="$HOME_DIR/profiles/$1" generation
+  if [ -f "$root/current" ]; then
+    IFS= read -r generation < "$root/current" || return 1
+    case "$generation" in ''|*/*|.*) return 1 ;; esac
+    [ -f "$root/generations/$generation/env" ] || return 1
+    printf '%s' "$root/generations/$generation"
+  elif [ -f "$root/env" ]; then printf '%s' "$root"; else return 1; fi
+}
 
-start_proxy() {
-  proxy_listening && return 0
-  [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] || {
-    echo "qbraid-code: GPT models need the local proxy, which is not installed." >&2
-    echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
-    return 1
-  }
-  [ -s "$HOME_DIR/proxy-config.yaml" ] || {
-    echo "qbraid-code: proxy config missing — re-run the installer." >&2
-    return 1
-  }
-  # `nohup` is POSIX and present everywhere in practice, but if it is missing
-  # the redirect below still detaches well enough for our purposes — better a
-  # working proxy than a hard failure over a missing convenience wrapper.
-  if command -v nohup >/dev/null 2>&1; then
-    nohup "$PROXY_BIN" -config "$HOME_DIR/proxy-config.yaml" \
-      >> "$HOME_DIR/proxy.log" 2>&1 &
-  else
-    "$PROXY_BIN" -config "$HOME_DIR/proxy-config.yaml" \
-      >> "$HOME_DIR/proxy.log" 2>&1 &
+list_profiles() {
+  local dir slug mark label resolved
+  for dir in "$HOME_DIR"/profiles/*; do
+    [ -d "$dir" ] || continue
+    slug=${dir##*/}; mark=' '
+    resolved=$(profile_dir "$slug" 2>/dev/null || true)
+    [ -n "$resolved" ] || continue
+    [ "$slug" = "${ACTIVE_PROFILE:-}" ] && mark='*'
+    label=$(cat "$resolved/label" 2>/dev/null || printf '%s' "$slug")
+    printf '%s %-32s %s\n' "$mark" "$slug" "$label"
+  done
+}
+
+EXPLICIT_PROFILE=""
+PROFILE_OPTION=0
+if [ "${1:-}" = --profile ]; then
+  PROFILE_OPTION=1
+  [ "$#" -ge 2 ] || { echo 'qbraid-code: --profile needs a name' >&2; exit 1; }
+  EXPLICIT_PROFILE="$2"; shift 2
+fi
+ALLOW_PROFILE_RESUME=0
+if [ "${1:-}" = --allow-profile-resume ]; then ALLOW_PROFILE_RESUME=1; shift; fi
+ACTIVE_PROFILE=""
+[ ! -f "$HOME_DIR/active-profile" ] || IFS= read -r ACTIVE_PROFILE < "$HOME_DIR/active-profile" || true
+case "${1:-}" in
+  --profiles) list_profiles; exit 0 ;;
+  --use-profile)
+    [ "$#" -ge 2 ] || { echo 'qbraid-code: --use-profile needs a name' >&2; exit 1; }
+    valid_profile_slug "$2" && profile_dir "$2" >/dev/null || {
+      echo "qbraid-code: invalid profile '$2'" >&2; exit 1;
+    }
+    printf '%s\n' "$2" > "$HOME_DIR/active-profile.tmp.$$"
+    mv "$HOME_DIR/active-profile.tmp.$$" "$HOME_DIR/active-profile"
+    echo "qbraid-code: active profile is now $2"
+    exit 0 ;;
+esac
+if [ "$PROFILE_OPTION" -eq 1 ]; then
+  PROFILE="$EXPLICIT_PROFILE"
+else
+  PROFILE="${QBRAID_CODE_PROFILE:-$ACTIVE_PROFILE}"
+  [ -n "$PROFILE" ] || PROFILE=default
+fi
+valid_profile_slug "$PROFILE" || { echo "qbraid-code: invalid profile '$PROFILE'" >&2; exit 1; }
+PROFILE_ROOT="$HOME_DIR/profiles/$PROFILE"
+PROFILE_HOME=$(profile_dir "$PROFILE" 2>/dev/null || true)
+if [ -z "$PROFILE_HOME" ]; then
+  if [ "$PROFILE" = default ] && [ -f "$HOME_DIR/env" ]; then PROFILE_ROOT="$HOME_DIR"; PROFILE_HOME="$HOME_DIR"; else
+    echo "qbraid-code: profile '$PROFILE' is not installed" >&2
+    echo "Install it with: curl -fsSL https://qbraid.com/code.sh | bash -s -- --profile $PROFILE" >&2
+    exit 1
   fi
-  i=0
-  while [ "$i" -lt 40 ]; do
-    if proxy_listening; then
-      PROXY_STARTED_BY_US=1
+fi
+SESSION_LEASED=0
+acquire_session_lease() {
+  local i=0 owner update_owner
+  while [ "$i" -lt 200 ]; do
+    if mkdir "$PROFILE_ROOT/.coord-lock" 2>/dev/null; then
+      printf '%s\n' "$$" > "$PROFILE_ROOT/.coord-lock/pid"
+      if [ -d "$PROFILE_ROOT/.update-lock" ]; then
+        update_owner=$(cat "$PROFILE_ROOT/.update-lock/pid" 2>/dev/null || true)
+        if [ -n "$update_owner" ] && kill -0 "$update_owner" 2>/dev/null; then
+          rm -rf "$PROFILE_ROOT/.coord-lock"; i=$((i + 1)); sleep 0.3; continue
+        fi
+        rm -rf "$PROFILE_ROOT/.update-lock"
+      fi
+      mkdir -p "$PROFILE_ROOT/session-users"
+      : > "$PROFILE_ROOT/session-users/$$"
+      rm -rf "$PROFILE_ROOT/.coord-lock"
+      SESSION_LEASED=1
       return 0
     fi
-    sleep 0.3
-    i=$((i + 1))
+    owner=$(cat "$PROFILE_ROOT/.coord-lock/pid" 2>/dev/null || true)
+    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$PROFILE_ROOT/.coord-lock"; fi
+    i=$((i + 1)); sleep 0.3
   done
-  # An empty log is the confusing case: it means the binary never ran (missing
-  # dependency, wrong architecture, quarantined) rather than failing on config.
-  echo "qbraid-code: the GPT proxy did not start." >&2
-  if [ -s "$HOME_DIR/proxy.log" ]; then
-    echo "Last lines of $HOME_DIR/proxy.log:" >&2
-    tail -5 "$HOME_DIR/proxy.log" >&2
-  else
-    echo "It produced no output at all — try running it directly to see why:" >&2
-    echo "  $PROXY_BIN -config $HOME_DIR/proxy-config.yaml" >&2
-  fi
-  echo "Claude models are unaffected; run qbraid-code without --model gpt-... " >&2
+  echo "qbraid-code: profile '$PROFILE' is being updated. Try again shortly." >&2
   return 1
+}
+release_session_lease() {
+  [ "$SESSION_LEASED" -ne 1 ] || rm -f "$PROFILE_ROOT/session-users/$$"
+  SESSION_LEASED=0
+}
+acquire_session_lease || exit 1
+trap release_session_lease EXIT INT TERM HUP
+export QBRAID_CODE_PROFILE_HOME="$PROFILE_HOME"
+export QBRAID_CODE_PROFILE="$PROFILE"
+env_value() {
+  awk -v key="$1" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' "$PROFILE_HOME/env"
+}
+BASE_URL=$(env_value QBRAID_CODE_BASE_URL)
+API_BASE=$(env_value QBRAID_CODE_API_BASE)
+TOKEN=$(env_value QBRAID_CODE_TOKEN)
+if [ -z "$TOKEN" ]; then
+  SECRET_BACKEND=$(env_value QBRAID_CODE_SECRET_BACKEND)
+  SECRET_REF=$(env_value QBRAID_CODE_SECRET_REF)
+  case "$SECRET_BACKEND" in
+    keychain) TOKEN=$(security find-generic-password -a "${USER:-$(id -un)}" -s "$SECRET_REF" -w 2>/dev/null || true) ;;
+    secret-service) command -v secret-tool >/dev/null 2>&1 && TOKEN=$(secret-tool lookup service qbraid-code ref "$SECRET_REF" 2>/dev/null || true) ;;
+    file)
+      SECRET_MODE=$(stat -c '%a' "$SECRET_REF" 2>/dev/null || stat -f '%Lp' "$SECRET_REF" 2>/dev/null || true)
+      [ "$SECRET_MODE" = 600 ] && TOKEN=$(cat "$SECRET_REF" 2>/dev/null || true) ;;
+  esac
+fi
+MODEL=$(env_value QBRAID_CODE_MODEL)
+PROXY_PORT=$(env_value QBRAID_CODE_PROXY_PORT); [ -n "$PROXY_PORT" ] || PROXY_PORT=8320
+PROXY_BIN=$(env_value QBRAID_CODE_PROXY_BIN)
+PROXY_URL="http://127.0.0.1:$PROXY_PORT"
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+}
+
+for resume_arg in "$@"; do
+  if [ "$resume_arg" = "--global" ]; then echo "qbraid-code: --global was removed because project settings can exfiltrate its credential. Use qbraid-code." >&2; exit 1; fi
+  if [ "$ALLOW_PROFILE_RESUME" -ne 1 ]; then
+    case "$resume_arg" in
+      -c|--continue|--resume|--resume=*)
+        echo "qbraid-code: resuming requires explicit profile confirmation." >&2
+        echo "Add --allow-profile-resume after --profile to confirm." >&2
+        exit 1 ;;
+    esac
+  fi
+done
+
+# ---------------------------------------------------------------- GPT proxy
+# The gateway serves GPT models only on its OpenAI-compatible surface. A
+# loopback proxy translates GPT traffic and passes Claude traffic through.
+
+RUNTIME_DIR=""
+PORT_LOCK=""
+PROXY_PID=""
+RUNTIME_LOCAL_KEY=""
+
+proxy_listening() {
+  [ -n "$RUNTIME_LOCAL_KEY" ] || return 1
+  printf 'header = "Authorization: Bearer %s"\n' "$RUNTIME_LOCAL_KEY" |
+    curl -fs -m 3 -o /dev/null --config - "$PROXY_URL/v1/models" 2>/dev/null
+}
+
+scavenge_runtimes() {
+  local runtime owner pid command i
+  for runtime in "$HOME_DIR"/runtime.*; do
+    [ -d "$runtime" ] || continue
+    owner=$(cat "$runtime/owner.pid" 2>/dev/null || true)
+    [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && continue
+    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true); command=""
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if [ -r "/proc/$pid/cmdline" ]; then command=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      elif command -v ps >/dev/null 2>&1; then command=$(ps -p "$pid" -o command= 2>/dev/null || true); fi
+      case "$command" in *"$runtime/proxy-config.yaml"*) kill "$pid" 2>/dev/null || true; i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true ;; esac
+    fi
+    rm -rf "$runtime"
+  done
+}
+
+prepare_proxy_runtime() {
+  local candidate owner line auth_escaped
+  scavenge_runtimes
+  mkdir -p "$HOME_DIR/ports"
+  chmod 700 "$HOME_DIR/ports" 2>/dev/null || true
+  candidate=$PROXY_PORT
+  while [ "$candidate" -le 8999 ]; do
+    if { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || { [ -x /usr/sbin/lsof ] && /usr/sbin/lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || { command -v nc >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 "$candidate" >/dev/null 2>&1; } || (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then candidate=$((candidate + 1)); continue; fi
+    if mkdir "$HOME_DIR/ports/$candidate" 2>/dev/null; then
+      printf '%s\n' "$$" > "$HOME_DIR/ports/$candidate/pid"
+      PORT_LOCK="$HOME_DIR/ports/$candidate"
+      PROXY_PORT=$candidate
+      PROXY_URL="http://127.0.0.1:$PROXY_PORT"
+      break
+    fi
+    owner=$(cat "$HOME_DIR/ports/$candidate/pid" 2>/dev/null || true)
+    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$HOME_DIR/ports/$candidate"; continue; fi
+    candidate=$((candidate + 1))
+  done
+  [ -n "$PORT_LOCK" ] || { echo 'qbraid-code: no local proxy port is available.' >&2; return 1; }
+  RUNTIME_DIR=$(mktemp -d "$HOME_DIR/runtime.$PROFILE.XXXXXX")
+  chmod 700 "$RUNTIME_DIR"
+  printf '%s\n' "$$" > "$RUNTIME_DIR/owner.pid"
+  RUNTIME_LOCAL_KEY=$(od -An -tx1 -N 24 /dev/urandom | tr -d ' \n')
+  auth_escaped=$(printf '%s' "$RUNTIME_DIR/auth" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      'port: __PORT__') printf 'port: %s\n' "$PROXY_PORT" ;;
+      'auth-dir: "__AUTH_DIR__"') printf 'auth-dir: "%s"\n' "$auth_escaped" ;;
+      '  - "__LOCAL_KEY__"') printf '  - "%s"\n' "$RUNTIME_LOCAL_KEY" ;;
+      '  - api-key: "__QBRAID_KEY__"') printf '  - api-key: "%s"\n' "$TOKEN" ;;
+      '      - api-key: "__QBRAID_KEY__"') printf '      - api-key: "%s"\n' "$TOKEN" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$PROFILE_HOME/proxy-template.yaml" > "$RUNTIME_DIR/proxy-config.yaml"
+  chmod 600 "$RUNTIME_DIR/proxy-config.yaml"
+}
+
+cleanup_proxy() {
+  local i=0
+  if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+    kill "$PROXY_PID" 2>/dev/null || true
+    while kill -0 "$PROXY_PID" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -0 "$PROXY_PID" 2>/dev/null && kill -KILL "$PROXY_PID" 2>/dev/null || true
+  fi
+  [ -z "$RUNTIME_DIR" ] || rm -rf "$RUNTIME_DIR"
+  [ -z "$PORT_LOCK" ] || rm -rf "$PORT_LOCK"
+  PROXY_PID=""; RUNTIME_DIR=""; PORT_LOCK=""; RUNTIME_LOCAL_KEY=""
+}
+
+start_proxy() {
+  [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] || { echo 'qbraid-code: local proxy is not installed.' >&2; return 1; }
+  [ -s "$PROFILE_HOME/proxy-template.yaml" ] || { echo 'qbraid-code: proxy template missing. Re-run the installer.' >&2; return 1; }
+  prepare_proxy_runtime || return 1
+  "$PROXY_BIN" -config "$RUNTIME_DIR/proxy-config.yaml" >> "$RUNTIME_DIR/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  printf '%s\n' "$PROXY_PID" > "$RUNTIME_DIR/proxy.pid"
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    if proxy_listening; then return 0; fi
+    kill -0 "$PROXY_PID" 2>/dev/null || break
+    sleep 0.3; i=$((i + 1))
+  done
+  echo 'qbraid-code: the local proxy did not start.' >&2
+  [ ! -s "$RUNTIME_DIR/proxy.log" ] || tail -5 "$RUNTIME_DIR/proxy.log" >&2
+  cleanup_proxy
+  return 1
+}
+
+stop_all_proxies() {
+  local runtime pid command i
+  for runtime in "$HOME_DIR"/runtime.*; do
+    [ -d "$runtime" ] || continue
+    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true)
+    command=""
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      if [ -r "/proc/$pid/cmdline" ]; then command=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      elif command -v ps >/dev/null 2>&1; then command=$(ps -p "$pid" -o command= 2>/dev/null || true); fi
+      case "$command" in *"$runtime/proxy-config.yaml"*)
+        kill "$pid" 2>/dev/null || true; i=0
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true ;;
+      esac
+    fi
+    owner=$(cat "$runtime/owner.pid" 2>/dev/null || true)
+    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$runtime"; fi
+  done
 }
 
 # The requested model decides the route: an explicit --model wins over the
@@ -95,6 +301,19 @@ requested_model() {
     prev="$a"
   done
   printf '%s' "$MODEL"
+}
+
+has_model_arg() {
+  local a
+  for a in "$@"; do case "$a" in --model|--model=*) return 0 ;; esac; done
+  return 1
+}
+
+model_context() {
+  local id="${1#anthropic-compat/}"
+  id=${id%\[1m\]}
+  [ -f "$PROFILE_HOME/models.tsv" ] || return 0
+  awk -F '\t' -v wanted="$id" '$1 == wanted { print $2; exit }' "$PROFILE_HOME/models.tsv"
 }
 
 parse_claude_version() { # parse_claude_version <claude --version output>
@@ -146,18 +365,15 @@ missing_keys() {
   local missing=""
   [ -n "$BASE_URL" ] || missing="$missing QBRAID_CODE_BASE_URL"
   [ -n "$API_BASE" ] || missing="$missing QBRAID_CODE_API_BASE"
-  [ -n "$TOKEN" ]    || missing="$missing QBRAID_CODE_TOKEN"
+  [ -n "$TOKEN" ]    || missing="$missing profile-secret"
   [ -n "$MODEL" ]    || missing="$missing QBRAID_CODE_MODEL"
   printf '%s' "$missing"
 }
 
 case "${1:-}" in
   --stop)
-    if [ -n "$PROXY_BIN" ] && pkill -f "$PROXY_BIN -config $HOME_DIR/proxy-config.yaml" 2>/dev/null; then
-      echo "qbraid-code: proxy stopped"
-    else
-      echo "qbraid-code: proxy was not running"
-    fi
+    stop_all_proxies
+    echo "qbraid-code: local proxies stopped"
     exit 0 ;;
   --doctor)
     CLAUDE_VERSION=""; CLAUDE_STATUS=missing
@@ -189,15 +405,16 @@ case "${1:-}" in
       echo "config:   INCOMPLETE — missing:$MISSING"
       echo "          re-run: curl -fsSL https://qbraid.com/code.sh | bash"
     else
-      echo "config:   $HOME_DIR/env"
+      echo "config:   $PROFILE_HOME/env"
     fi
 
     if [ -n "$TOKEN" ] && [ -n "$API_BASE" ]; then
       TMP=$(mktemp)
       # Separate transport failure from rejection. Reporting "REJECTED" for a
       # dropped connection sent people off to make a new key for no reason.
-      STATUS=$(curl -sS -m 20 -o "$TMP" -w '%{http_code}' \
-        "$API_BASE/billing/credits/balance" -H "X-API-Key: $TOKEN" 2>/dev/null) || STATUS="000"
+      STATUS=$(printf 'header = "X-API-Key: %s"\n' "$TOKEN" |
+        curl -sS -m 20 -o "$TMP" -w '%{http_code}' --config - \
+          "$API_BASE/billing/credits/balance" 2>/dev/null) || STATUS="000"
       BODY=$(cat "$TMP"); rm -f "$TMP"
       case "$STATUS" in
         200)
@@ -226,7 +443,8 @@ case "${1:-}" in
     fi
 
     if [ -n "$BASE_URL" ] \
-      && curl -fsS -m 20 -o /dev/null "$BASE_URL/v1/models" -H "X-API-Key: $TOKEN" 2>/dev/null; then
+      && printf 'header = "X-API-Key: %s"\n' "$TOKEN" | \
+        curl -fsS -m 20 -o /dev/null --config - "$BASE_URL/v1/models" 2>/dev/null; then
       echo "gateway:  reachable"
     else
       echo "gateway:  UNREACHABLE"
@@ -251,37 +469,34 @@ case "${1:-}" in
     echo "model:    ${MODEL:-not set}"
 
     if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ]; then
-      if proxy_listening; then
-        echo "gpt:      proxy running on $PROXY_URL"
-      else
-        echo "gpt:      proxy installed (starts on demand with --model gpt-...)"
-      fi
+      echo "proxy:    installed (starts once per launch)"
     else
-      echo "gpt:      NOT AVAILABLE — re-run the installer to add GPT models"
+      echo "proxy:    NOT AVAILABLE — re-run the installer"
     fi
     exit 0 ;;
   --help|-h)
     cat <<EOF
 qbraid-code — Claude Code, powered by the qBraid AI gateway.
 
-  qbraid-code [claude args...]   start a session
-  qbraid-code -p "..."           ask one question and exit
-  qbraid-code --doctor           check your setup
-  qbraid-code --stop             stop the background GPT proxy
-  qbraid-code --model gpt-5.6-sol ...   use a GPT model (starts a local proxy)
+  qbraid-code [claude args...]        start a session
+  qbraid-code --profile NAME [...]    bind one session to NAME
+  qbraid-code --profiles              list profiles
+  qbraid-code --use-profile NAME      select future sessions
+  qbraid-code --doctor                check the bound profile
+  qbraid-code --stop                  stop orphaned local proxies
 
 Any other arguments are passed straight through to \`claude\`, so
 \`-c\`, \`--allowedTools\`, \`--model\`, and the rest behave normally.
 
 Default model: ${MODEL:-not set}
-Change it by editing $HOME_DIR/env, or pass --model.
+Change it by editing $PROFILE_HOME/env, or pass --model.
 EOF
     exit 0 ;;
 esac
 
 MISSING=$(missing_keys)
 if [ -n "$MISSING" ]; then
-  echo "qbraid-code: $HOME_DIR/env is incomplete — missing:$MISSING" >&2
+  echo "qbraid-code: $PROFILE_HOME/env is incomplete — missing:$MISSING" >&2
   echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
   exit 1
 fi
@@ -293,91 +508,103 @@ command -v claude >/dev/null 2>&1 || {
 }
 
 RUN_MODEL=$(requested_model "$@")
+LAUNCH_MODEL="$RUN_MODEL"
+CONTEXT_TOKENS=$(model_context "$RUN_MODEL")
+unset CLAUDE_CODE_MAX_CONTEXT_TOKENS MAX_THINKING_TOKENS CLAUDE_CODE_DISABLE_THINKING
+if [ -n "$CONTEXT_TOKENS" ] && [ "$CONTEXT_TOKENS" -ge 1000000 ] && ! has_model_arg "$@"; then
+  LAUNCH_MODEL="${RUN_MODEL%\[1m\]}[1m]"
+elif [ -n "$CONTEXT_TOKENS" ]; then
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$CONTEXT_TOKENS"
+else
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000
+fi
+CREDIT_TMP=$(mktemp)
+CREDIT_STATUS=$(printf 'header = "X-API-Key: %s"\n' "$TOKEN" |
+  curl -sS -m 8 -o "$CREDIT_TMP" -w '%{http_code}' --config - "$API_BASE/billing/credits/balance" 2>/dev/null) || CREDIT_STATUS=000
+if [ "$CREDIT_STATUS" = 200 ]; then
+  CREDIT_VALUE=$(set +o pipefail; grep -o '"qbraidCredits":-\?[0-9.]*' "$CREDIT_TMP" | head -1 | sed 's/.*://')
+  if [ -n "$CREDIT_VALUE" ]; then
+    printf '%s\n' "$CREDIT_VALUE" > "$PROFILE_HOME/credits.cache.tmp.$$"
+    mv "$PROFILE_HOME/credits.cache.tmp.$$" "$PROFILE_HOME/credits.cache"
+    date +%s > "$PROFILE_HOME/credits.updated.tmp.$$"
+    mv "$PROFILE_HOME/credits.updated.tmp.$$" "$PROFILE_HOME/credits.updated"
+  fi
+fi
+rm -f "$CREDIT_TMP"
 RUN_BASE="$BASE_URL"
 RUN_TOKEN="$TOKEN"
-if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] && [ -s "$HOME_DIR/proxy-config.yaml" ]; then
+PROXY_ACQUIRED=0
+if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] && [ -s "$PROFILE_HOME/proxy-template.yaml" ]; then
   # Unified route: the proxy serves EVERY model on one endpoint — Claude
   # models pass through to the Anthropic surface untouched, GPT models are
   # translated to the OpenAI surface — so /v1/models lists all of them and
   # `/model <name>` works for any of them mid-session. Azure caps `tools` at
   # 128 for GPT models; with many MCP servers use --strict-mcp-config.
   if start_proxy; then
+    PROXY_ACQUIRED=1
     RUN_BASE="$PROXY_URL"
-    RUN_TOKEN=$(cat "$HOME_DIR/proxy.key")
-    # Populate the /model picker from the proxy's model list. Claude Code
-    # fetches {base}/v1/models at startup and shows rows labeled "From
-    # gateway"; GPT models appear via their anthropic-compat/ aliases.
-    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
-    # The picker's BUILT-IN tier rows (Opus/Sonnet/Haiku) point at Anthropic's
-    # dated first-party ids, which this proxy does not serve — selecting one
-    # silently broke the session. Remap them to the gateway's ids so every
-    # row in the picker actually routes.
-    export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5"
-    export ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="Opus 5 (qBraid)"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
-    export ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="Sonnet 4.6 (qBraid)"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="Haiku 4.5 (qBraid)"
+    RUN_TOKEN="$RUNTIME_LOCAL_KEY"
+    unset CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="$LAUNCH_MODEL"
+    export ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="Relaunch to change model"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="$LAUNCH_MODEL"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="Relaunch to change model"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$LAUNCH_MODEL"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="Relaunch to change model"
   else
-    case "$RUN_MODEL" in
-      gpt-*|*/gpt-*) exit 1 ;;  # start_proxy already explained
-      *) echo "qbraid-code: proxy unavailable — using the gateway directly (Claude models only)." >&2 ;;
-    esac
+    exit 1
   fi
 else
-  case "$RUN_MODEL" in
-    gpt-*|*/gpt-*)
-      echo "qbraid-code: GPT models need the local proxy, which is not installed." >&2
-      echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
-      exit 1 ;;
-  esac
+  echo "qbraid-code: the credential-isolating local proxy is not configured." >&2
+  echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
+  exit 1
 fi
 
-# ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which both the
-# gateway and the proxy accept. ANTHROPIC_API_KEY would work too, but it makes
-# Claude Code ask the user to approve a custom API key on first run — a prompt
-# with no good answer for someone who just wants to start working.
-#
-# MAX_THINKING_TOKENS=0: recent Claude Code sends `thinking: {type: "adaptive"}`,
-# which the gateway's Anthropic surface rejects (it accepts enabled|disabled —
-# qbraid-api ai-request.validators.ts) and GPT models reject outright.
-# FORCED, not defaulted: an inherited MAX_THINKING_TOKENS from the user's
-# shell re-enables thinking and turns every request into that 400. Relax to
-# Claude-only once the gateway accepts "adaptive".
-run_claude() {
-  MAX_THINKING_TOKENS=0 \
-  ANTHROPIC_BASE_URL="$RUN_BASE" \
-  ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
-  ANTHROPIC_MODEL="$RUN_MODEL" \
-  ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
-  CLAUDE_CODE_SUBAGENT_MODEL="$RUN_MODEL" \
-  claude "$@"
-}
-
-if [ "$PROXY_STARTED_BY_US" = 1 ]; then
-  # We started the proxy for this session, so we clean it up — leaving a
-  # background process running after the user quits is our bug, not theirs.
-  # A proxy that was ALREADY running belongs to someone else: leave it.
-  # No `exec` here, so this shell survives to do the cleanup; the trap also
-  # covers Ctrl+C and terminal close.
-  stop_our_proxy() {
-    pkill -f "$PROXY_BIN -config $HOME_DIR/proxy-config.yaml" 2>/dev/null || true
+# Pin gateway credentials through CLI settings. CLI settings outrank user
+# settings, while `--setting-sources user` excludes project hooks and env.
+SESSION_DIR=$(mktemp -d "$HOME_DIR/session.$PROFILE.XXXXXX")
+chmod 700 "$SESSION_DIR"
+printf '%s\n' "$$" > "$SESSION_DIR/owner.pid"
+for status_file in label label-source organization-id credits.cache credits.updated; do
+  [ ! -f "$PROFILE_HOME/$status_file" ] || cp "$PROFILE_HOME/$status_file" "$SESSION_DIR/$status_file"
+done
+[ -f "$SESSION_DIR/label" ] || printf '%s\n' "$PROFILE" > "$SESSION_DIR/label"
+SETTINGS_FILE="$SESSION_DIR/settings.json"
+BOUND_CONTEXT="${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-1000000}"
+cat > "$SETTINGS_FILE" <<EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$(json_escape "$RUN_BASE")",
+    "ANTHROPIC_AUTH_TOKEN": "$(json_escape "$RUN_TOKEN")",
+    "ANTHROPIC_MODEL": "$(json_escape "$LAUNCH_MODEL")",
+    "ANTHROPIC_SMALL_FAST_MODEL": "$(json_escape "$LAUNCH_MODEL")",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$(json_escape "$LAUNCH_MODEL")",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$(json_escape "$LAUNCH_MODEL")",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$(json_escape "$LAUNCH_MODEL")",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$(json_escape "$LAUNCH_MODEL")",
+    "QBRAID_CODE_PROFILE": "$(json_escape "$PROFILE")",
+    "QBRAID_CODE_PROFILE_HOME": "$(json_escape "$SESSION_DIR")",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "$(json_escape "$BOUND_CONTEXT")"
   }
-  trap 'stop_our_proxy' EXIT INT TERM HUP
-  run_claude "$@"
-  STATUS=$?
-  stop_our_proxy
-  trap - EXIT INT TERM HUP
-  exit "$STATUS"
-fi
-
-exec_claude() {
-  MAX_THINKING_TOKENS=0 \
-  ANTHROPIC_BASE_URL="$RUN_BASE" \
-  ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
-  ANTHROPIC_MODEL="$RUN_MODEL" \
-  ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
-  CLAUDE_CODE_SUBAGENT_MODEL="$RUN_MODEL" \
-  exec claude "$@"
 }
-exec_claude "$@"
+EOF
+chmod 600 "$SETTINGS_FILE"
+export QBRAID_CODE_PROFILE_HOME="$SESSION_DIR"
+cleanup_session() {
+  [ "$PROXY_ACQUIRED" -ne 1 ] || { cleanup_proxy; PROXY_ACQUIRED=0; }
+  release_session_lease
+  rm -rf "$SESSION_DIR"
+}
+trap cleanup_session EXIT INT TERM HUP
+set +e
+ANTHROPIC_BASE_URL="$RUN_BASE" \
+ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
+ANTHROPIC_MODEL="$LAUNCH_MODEL" \
+ANTHROPIC_SMALL_FAST_MODEL="$LAUNCH_MODEL" \
+CLAUDE_CODE_SUBAGENT_MODEL="$LAUNCH_MODEL" \
+claude "$@" --settings "$SETTINGS_FILE" --setting-sources user
+STATUS=$?
+set -e
+cleanup_session
+trap - EXIT INT TERM HUP
+exit "$STATUS"

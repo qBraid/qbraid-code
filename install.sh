@@ -2,13 +2,11 @@
 # qbraid-code installer — Claude Code, powered by the qBraid AI gateway.
 #
 #   curl -fsSL https://qbraid.com/code.sh | bash
-#   curl -fsSL https://qbraid.com/code.sh | bash -s -- --global
 #
-# There is no proxy and no daemon. The qBraid gateway serves an
-# Anthropic-compatible surface, so Claude Code talks to it directly through
-# ANTHROPIC_BASE_URL. The double `v1` in /api/v1/ai/v1/messages is deliberate,
-# not a typo: Claude Code appends /v1/messages to whatever base URL it is
-# given.
+# Claude models use the gateway's Anthropic-compatible surface. GPT models
+# use an on-demand loopback translation proxy. The double `v1` in
+# /api/v1/ai/v1/messages is deliberate because Claude Code appends
+# /v1/messages to ANTHROPIC_BASE_URL.
 #
 # Everything this writes lives in ~/.qbraid-code and ~/.local/bin.
 # Re-running is safe.
@@ -22,10 +20,12 @@ MCP_NAME="qbraid"
 # Anthropic Messages API; the gateway serves GPT only on its OpenAI-compat
 # surface. CLIProxyAPI bridges the two on loopback. Port is qbraid-code's own —
 # claudeseek and other tools use neighbouring ports.
-PROXY_PORT="${QBRAID_CODE_PROXY_PORT:-8320}"
+PROXY_PORT_OVERRIDE="${QBRAID_CODE_PROXY_PORT:-}"
+PROXY_PORT=""
 PROXY_REPO="router-for-me/CLIProxyAPI"
 MCP_URL="https://mcp.qbraid.com/mcp"
 KEYS_URL="https://account.qbraid.com/account/api-keys"
+CLAUDE_RELEASES_URL="https://downloads.claude.ai/claude-code-releases"
 CLAUDE_MIN_VERSION="2.1.186"
 CLAUDE_TESTED_MAX="2.1.238"
 
@@ -42,30 +42,154 @@ CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
 CLAUDE_JSON="$HOME/.claude.json"
 
-GLOBAL=0
-GLOBAL_APPLIED=0
-for arg in "$@"; do
-  case "$arg" in
-    --global) GLOBAL=1 ;;
+PROFILE="${QBRAID_CODE_PROFILE:-}"
+PROFILE_OPTION=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --global) printf 'error: --global was removed because project settings can exfiltrate its credential. Use qbraid-code.\n' >&2; exit 1 ;;
+    --profile)
+      [ "$#" -ge 2 ] || { printf 'error: --profile needs a name\n' >&2; exit 1; }
+      PROFILE_OPTION=1; PROFILE="$2"; shift 2 ;;
+    --profile=*) PROFILE_OPTION=1; PROFILE="${1#--profile=}"; shift ;;
     --help|-h)
       cat <<'EOF'
 qbraid-code installer
 
-  --global   also point the plain `claude` command at qBraid
-  --help     show this message
+  --profile NAME   create or update a named qBraid profile
+  --global         removed. Use the isolated qbraid-code wrapper.
+  --help           show this message
 
 Environment:
-  QBRAID_API_KEY        use this key instead of prompting
-  QBRAID_CODE_MODEL     use this model instead of prompting
-  QBRAID_CODE_HOME      config directory (default ~/.qbraid-code)
-  QBRAID_CODE_BIN_DIR   install directory (default ~/.local/bin)
-  QBRAID_CODE_CLAUDE_POLICY
-                         prompt, upgrade, fail, or continue
+  QBRAID_API_KEY             use this key instead of prompting
+  QBRAID_CODE_MODEL          use this model instead of prompting
+  QBRAID_CODE_PROFILE_LABEL  readable local account label
+  QBRAID_CODE_CLAUDE_POLICY  prompt, upgrade, fail, or continue
+  QBRAID_CODE_HOME           config directory (default ~/.qbraid-code)
+  QBRAID_CODE_BIN_DIR        install directory (default ~/.local/bin)
 EOF
       exit 0 ;;
-    *) ;;
+    *) printf 'error: unknown option: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
+[ "$PROFILE_OPTION" -eq 0 ] || [ -n "$PROFILE" ] || { printf 'error: invalid empty profile\n' >&2; exit 1; }
+
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed 's/'"'"'/'"'"'\\'"'"''"'"'/g'
+  printf "'"
+}
+
+json_escape_value() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+}
+
+valid_profile_slug() {
+  local LC_ALL=C
+  case "${1:-}" in
+    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 32 ]
+}
+
+sanitize_profile_label() { # sanitize_profile_label <label> <fallback>
+  local label bytes
+  label=$(printf '%s' "$1" | tr -d '\001-\037\177')
+  bytes=$(LC_ALL=C printf '%s' "$label" | wc -c | tr -d ' ')
+  if [ -n "$label" ] && [ "$bytes" -le 80 ]; then printf '%s' "$label"; else printf '%s' "$2"; fi
+}
+
+adopt_legacy_profile() { # adopt_legacy_profile <root>
+  local root="$1" dest="$1/profiles/default" stage item token secret_ref account
+  [ -f "$root/env" ] || return 0
+  [ ! -e "$dest" ] || return 0
+  stage="$root/profiles/.default.migrate.$$"
+  rm -rf "$stage"; mkdir -p "$stage"; chmod 700 "$stage" 2>/dev/null || true
+  token=$(sed -n 's/^QBRAID_CODE_TOKEN=//p' "$root/env" | head -1)
+  grep -v '^QBRAID_CODE_TOKEN=' "$root/env" > "$stage/env"
+  if [ -n "$token" ]; then
+    if [ "${OS:-linux}" = darwin ]; then
+      account="${USER:-$(id -un)}"; secret_ref='qbraid-code:default'
+      printf '%s\n%s\n' "$token" "$token" | security add-generic-password -U -a "$account" -s "$secret_ref" -w >/dev/null 2>&1 \
+        || { rm -rf "$stage"; die "could not migrate the default key into macOS Keychain."; }
+      printf 'QBRAID_CODE_SECRET_BACKEND=keychain\nQBRAID_CODE_SECRET_REF=%s\n' "$secret_ref" >> "$stage/env"
+    elif command -v secret-tool >/dev/null 2>&1 && printf '%s' "$token" | secret-tool store --label='qbraid-code default profile' service qbraid-code ref qbraid-code:default >/dev/null 2>&1; then
+      secret_ref='qbraid-code:default'
+      printf 'QBRAID_CODE_SECRET_BACKEND=secret-service\nQBRAID_CODE_SECRET_REF=%s\n' "$secret_ref" >> "$stage/env"
+    else
+      mkdir -p "$root/secrets"; chmod 700 "$root/secrets"
+      secret_ref="$root/secrets/default"
+      printf '%s\n' "$token" > "$secret_ref.tmp.$$"; chmod 600 "$secret_ref.tmp.$$"; mv "$secret_ref.tmp.$$" "$secret_ref"
+      printf 'QBRAID_CODE_SECRET_BACKEND=file\nQBRAID_CODE_SECRET_REF=%s\n' "$secret_ref" >> "$stage/env"
+    fi
+  fi
+  for item in label models.tsv credits.cache credits.updated organization-id label-source; do
+    [ -e "$root/$item" ] || continue
+    cp -R "$root/$item" "$stage/$item"
+  done
+  [ -f "$stage/label" ] || printf 'default\n' > "$stage/label"
+  [ -f "$stage/label-source" ] || printf 'local\n' > "$stage/label-source"
+  chmod -R go-rwx "$stage" 2>/dev/null || true
+  mv "$stage" "$dest"
+}
+
+scrub_legacy_token() { # scrub_legacy_token <root>
+  local root="$1" proxy_pid="" proxy_command="" keep_config=0
+  [ -e "$root/profiles/default" ] || return 0
+  if [ -f "$root/env" ]; then
+    { grep -v '^QBRAID_CODE_TOKEN=' "$root/env" || true; } > "$root/env.migrate.$$"
+    chmod 600 "$root/env.migrate.$$"; mv "$root/env.migrate.$$" "$root/env"
+  fi
+  proxy_pid=$(cat "$root/proxy.pid" 2>/dev/null || true)
+  if [ -n "$proxy_pid" ] && kill -0 "$proxy_pid" 2>/dev/null; then
+    keep_config=1
+    if [ -r "/proc/$proxy_pid/cmdline" ]; then proxy_command=$(tr '\000' ' ' < "/proc/$proxy_pid/cmdline" 2>/dev/null || true)
+    elif command -v ps >/dev/null 2>&1; then proxy_command=$(ps -p "$proxy_pid" -o command= 2>/dev/null || true); fi
+    case "$proxy_command" in '') ;; *"$root/proxy-config.yaml"*) ;; *) keep_config=0 ;; esac
+  fi
+  [ "$keep_config" -eq 1 ] || rm -f "$root/proxy-config.yaml"
+}
+
+allocate_proxy_port() { # allocate_proxy_port <root> <profile> <existing>
+  local root="$1" existing="${3:-}" port=8320 file used
+  if [ -n "$existing" ]; then printf '%s\n' "$existing"; return; fi
+  while :; do
+    used=0
+    for file in "$root"/profiles/*/env; do
+      [ -f "$file" ] || continue
+      grep -q "^QBRAID_CODE_PROXY_PORT=$port$" "$file" && { used=1; break; }
+    done
+    [ "$used" -eq 1 ] || { printf '%s\n' "$port"; return; }
+    port=$((port + 1))
+  done
+}
+
+write_models_tsv() { # write_models_tsv <dest> <gateway-json>
+  local dest="$1" body="${2:-}" tmp row id context
+  tmp="$dest.tmp.$$"
+  cat > "$tmp" <<'EOF'
+gpt-5.6-sol	1050000
+claude-opus-5	1000000
+claude-sonnet-4-6	1000000
+claude-opus-4-8	1000000
+claude-haiku-4-5	200000
+gpt-5.4	400000
+gpt-5.4-mini	400000
+gpt-5.4-nano	400000
+EOF
+  printf '%s' "$body" | tr -d '\r\n' | sed 's/},{[[:space:]]*"id"/}\
+{"id"/g' |
+    while IFS= read -r row; do
+      id=$(printf '%s' "$row" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      context=$(printf '%s' "$row" | sed -n \
+        -e 's/.*"maxTokens"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        -e 's/.*"context_window"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        -e 's/.*"contextWindow"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+      [ -n "$id" ] && [ -n "$context" ] && printf '%s\t%s\n' "$id" "$context"
+    done >> "$tmp"
+  awk -F '\t' 'NF == 2 { values[$1]=$2 } END { for (id in values) print id "\t" values[id] }' "$tmp" |
+    sort > "$dest"
+  rm -f "$tmp"
+}
 
 # ------------------------------------------------------------------ output
 
@@ -145,6 +269,10 @@ compare_versions() { # compare_versions <left> <right> -> -1, 0, or 1
   }'
 }
 
+claude_upgrade_is_safe() { # claude_upgrade_is_safe <installed> <target>
+  [ -z "$1" ] || [ "$(compare_versions "$1" "$2")" -le 0 ]
+}
+
 claude_version_status() { # claude_version_status <version>
   local version="$1" compared
   [ -n "$version" ] || { printf 'unknown'; return; }
@@ -181,8 +309,16 @@ claude_supports_mcp_user_scope() {
 }
 
 install_claude_stable() {
-  warn "installing Claude Code from Anthropic's stable channel"
-  curl -fsSL https://claude.ai/install.sh | bash -s stable \
+  local installed="${CLAUDE_VERSION:-}" target raw
+  raw=$(curl -fsSL --max-time 20 "$CLAUDE_RELEASES_URL/stable") \
+    || die "could not resolve Anthropic's stable Claude Code version."
+  target=$(parse_claude_version "$raw")
+  [ -n "$target" ] && [ "$raw" = "$target" ] \
+    || die "Anthropic's stable Claude Code version was invalid."
+  claude_upgrade_is_safe "$installed" "$target" \
+    || die "Claude Code $installed is newer than stable $target. Refusing to downgrade it; update Claude Code manually or set QBRAID_CODE_CLAUDE_POLICY=continue."
+  warn "installing Claude Code $target from Anthropic's stable channel"
+  curl -fsSL https://claude.ai/install.sh | bash -s "$target" \
     || die "Claude Code stable-channel install failed. See https://claude.com/product/claude-code"
   export PATH="$HOME/.local/bin:$PATH"
   hash -r
@@ -312,7 +448,81 @@ command -v curl >/dev/null || die "curl is required but not installed."
 say "Platform: $OS/$ARCH"
 
 mkdir -p "$HOME_DIR" "$BIN_DIR" "$CLAUDE_DIR"
-
+INSTALL_LOCK="$HOME_DIR/.install-lock"
+if ! mkdir "$INSTALL_LOCK" 2>/dev/null; then
+  LOCK_PID=$(cat "$INSTALL_LOCK/pid" 2>/dev/null || true)
+  if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
+    die "another qbraid-code installer is running."
+  fi
+  rm -rf "$INSTALL_LOCK"
+  mkdir "$INSTALL_LOCK" 2>/dev/null || die "another qbraid-code installer is running."
+fi
+printf '%s\n' "$$" > "$INSTALL_LOCK/pid"
+PROFILE_UPDATE_LOCK=""
+PROFILE_STAGE=""
+SECRET_STAGED=0
+SECRET_BACKEND=""
+SECRET_REF=""
+cleanup_installer() {
+  if [ "$SECRET_STAGED" -eq 1 ]; then
+    case "$SECRET_BACKEND" in secret-service) secret-tool clear service qbraid-code ref "$SECRET_REF" >/dev/null 2>&1 || true ;; keychain) security delete-generic-password -a "${USER:-$(id -un)}" -s "$SECRET_REF" >/dev/null 2>&1 || true ;; file) rm -f "$SECRET_REF" ;; esac
+  fi
+  [ -z "$PROFILE_STAGE" ] || rm -rf "$PROFILE_STAGE"
+  [ -z "$PROFILE_UPDATE_LOCK" ] || rm -rf "$PROFILE_UPDATE_LOCK"
+  rm -rf "$INSTALL_LOCK"
+}
+trap cleanup_installer EXIT INT TERM HUP
+adopt_legacy_profile "$HOME_DIR"
+if [ -z "$PROFILE" ] && [ -f "$HOME_DIR/active-profile" ]; then
+  IFS= read -r PROFILE < "$HOME_DIR/active-profile" || true
+fi
+[ -n "$PROFILE" ] || PROFILE=default
+valid_profile_slug "$PROFILE" || die "invalid profile '$PROFILE'. Use letters, numbers, dot, underscore, or dash."
+PROFILE_ROOT="$HOME_DIR/profiles/$PROFILE"
+mkdir -p "$PROFILE_ROOT"
+chmod 700 "$PROFILE_ROOT" 2>/dev/null || true
+PROFILE_DIR="$PROFILE_ROOT"
+if [ -f "$PROFILE_ROOT/current" ]; then
+  IFS= read -r CURRENT_GENERATION < "$PROFILE_ROOT/current" || true
+  case "$CURRENT_GENERATION" in ''|*/*|.*) die "profile '$PROFILE' has an invalid generation pointer." ;; esac
+  [ -f "$PROFILE_ROOT/generations/$CURRENT_GENERATION/env" ] || die "profile '$PROFILE' generation is incomplete."
+  PROFILE_DIR="$PROFILE_ROOT/generations/$CURRENT_GENERATION"
+fi
+PROFILE_COORD_LOCK="$PROFILE_ROOT/.coord-lock"
+if ! mkdir "$PROFILE_COORD_LOCK" 2>/dev/null; then
+  COORD_PID=$(cat "$PROFILE_COORD_LOCK/pid" 2>/dev/null || true)
+  if [ -n "$COORD_PID" ] && kill -0 "$COORD_PID" 2>/dev/null; then die "profile '$PROFILE' is busy."; fi
+  rm -rf "$PROFILE_COORD_LOCK"; mkdir "$PROFILE_COORD_LOCK" || die "profile '$PROFILE' is busy."
+fi
+printf '%s\n' "$$" > "$PROFILE_COORD_LOCK/pid"
+PROFILE_UPDATE_LOCK="$PROFILE_ROOT/.update-lock"
+rm -rf "$PROFILE_UPDATE_LOCK"
+mkdir "$PROFILE_UPDATE_LOCK"
+printf '%s\n' "$$" > "$PROFILE_UPDATE_LOCK/pid"
+mkdir -p "$PROFILE_ROOT/session-users"
+for user_file in "$PROFILE_ROOT"/session-users/*; do
+  [ -f "$user_file" ] || continue
+  USER_PID=${user_file##*/}
+  if kill -0 "$USER_PID" 2>/dev/null; then
+    rm -rf "$PROFILE_COORD_LOCK"
+    die "profile '$PROFILE' has a running session. Update it after that session exits."
+  fi
+  rm -f "$user_file"
+done
+rm -rf "$PROFILE_COORD_LOCK"
+STALE_PROXY_PID=$(cat "$PROFILE_DIR/proxy.pid" 2>/dev/null || true)
+if [ -n "$STALE_PROXY_PID" ]; then
+  STALE_PROXY_COMMAND=""
+  if ! kill -0 "$STALE_PROXY_PID" 2>/dev/null; then rm -f "$PROFILE_DIR/proxy.pid"
+  else
+    if [ -r "/proc/$STALE_PROXY_PID/cmdline" ]; then STALE_PROXY_COMMAND=$(tr '\000' ' ' < "/proc/$STALE_PROXY_PID/cmdline" 2>/dev/null || true)
+    elif command -v ps >/dev/null 2>&1; then STALE_PROXY_COMMAND=$(ps -p "$STALE_PROXY_PID" -o command= 2>/dev/null || true); fi
+    case "$STALE_PROXY_COMMAND" in *" -config $PROFILE_DIR/proxy-config.yaml"*) kill "$STALE_PROXY_PID" 2>/dev/null || true; rm -f "$PROFILE_DIR/proxy.pid" ;; esac
+  fi
+fi
+EXISTING_PORT=""
+if [ -f "$PROFILE_DIR/env" ]; then EXISTING_PORT=$(sed -n 's/^QBRAID_CODE_PROXY_PORT=//p' "$PROFILE_DIR/env" | head -1); fi
+PROXY_PORT=$(allocate_proxy_port "$HOME_DIR" "$PROFILE" "${PROXY_PORT_OVERRIDE:-$EXISTING_PORT}")
 # Merging JSON into an existing settings file needs a real parser. On macOS
 # /usr/bin/python3 is a stub that pops a GUI installer prompt unless the
 # Command Line Tools are present, so check for those before trusting it.
@@ -320,6 +530,65 @@ have_python() {
   command -v python3 >/dev/null 2>&1 || return 1
   if [ "$OS" = darwin ] && ! xcode-select -p >/dev/null 2>&1; then return 1; fi
   python3 -c 'import json' >/dev/null 2>&1
+}
+
+remove_legacy_global_settings() {
+  [ -f "$SETTINGS" ] || { rm -f "$HOME_DIR/global-profile"; return 0; }
+  grep -q 'ANTHROPIC_BASE_URL.*api-v2.qbraid.com' "$SETTINGS" 2>/dev/null || { rm -f "$HOME_DIR/global-profile"; return 0; }
+  have_python || die "legacy plain-Claude gateway settings are unsafe. Remove the ANTHROPIC_* qBraid entries from $SETTINGS, then rerun."
+  python3 - "$SETTINGS" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+with open(path) as fh:
+    data = json.load(fh)
+env = data.get("env", {})
+for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "QBRAID_CODE_PROFILE", "QBRAID_CODE_HOME"):
+    env.pop(key, None)
+if not env:
+    data.pop("env", None)
+tmp = path + ".qbraid-code.tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, path)
+PY
+  rm -f "$HOME_DIR/global-profile"
+  warn "removed unsafe legacy plain-Claude gateway settings; use qbraid-code"
+}
+remove_legacy_global_settings
+
+read_profile_secret() {
+  local backend ref
+  [ -f "$PROFILE_DIR/env" ] || return 1
+  backend=$(sed -n 's/^QBRAID_CODE_SECRET_BACKEND=//p' "$PROFILE_DIR/env" | head -1)
+  ref=$(sed -n 's/^QBRAID_CODE_SECRET_REF=//p' "$PROFILE_DIR/env" | head -1)
+  case "$backend" in
+    keychain) security find-generic-password -a "${USER:-$(id -un)}" -s "$ref" -w 2>/dev/null ;;
+    secret-service) command -v secret-tool >/dev/null 2>&1 && secret-tool lookup service qbraid-code ref "$ref" 2>/dev/null ;;
+    file) [ -f "$ref" ] && cat "$ref" ;;
+    *) sed -n 's/^QBRAID_CODE_TOKEN=//p' "$PROFILE_DIR/env" | head -1 ;;
+  esac
+}
+
+store_profile_secret() {
+  SECRET_REF="qbraid-code:$PROFILE:$GENERATION"
+  if [ "$OS" = darwin ]; then
+    command -v security >/dev/null 2>&1 || die "macOS Keychain is unavailable."
+    printf '%s\n%s\n' "$API_KEY" "$API_KEY" | security add-generic-password -U -a "${USER:-$(id -un)}" -s "$SECRET_REF" -w >/dev/null 2>&1 \
+      || die "could not store the profile key in macOS Keychain."
+    SECRET_BACKEND="keychain"
+  elif command -v secret-tool >/dev/null 2>&1 && printf '%s' "$API_KEY" | secret-tool store --label="qbraid-code $PROFILE profile" service qbraid-code ref "qbraid-code:$PROFILE:$GENERATION" >/dev/null 2>&1; then
+    SECRET_REF="qbraid-code:$PROFILE:$GENERATION"
+    SECRET_BACKEND="secret-service"
+  else
+    SECRET_DIR="$HOME_DIR/secrets"
+    mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
+    SECRET_REF="$SECRET_DIR/$PROFILE.$GENERATION"
+    printf '%s\n' "$API_KEY" > "$SECRET_REF.tmp.$$"
+    chmod 600 "$SECRET_REF.tmp.$$"
+    mv "$SECRET_REF.tmp.$$" "$SECRET_REF"
+    SECRET_BACKEND="file"
+  fi
+  SECRET_STAGED=1
 }
 
 # ------------------------------------------------------------ 2. claude code
@@ -357,11 +626,11 @@ api_get() { # api_get <url> <key> [org-id]
   API_BODY=""
   tmp=$(mktemp) || { HTTP_STATUS="000"; return 0; }
   if [ -n "$org" ]; then
-    HTTP_STATUS=$(curl -sS -m 25 -o "$tmp" -w '%{http_code}' "$url" \
-      -H "X-API-Key: $key" -H "X-Organization-Id: $org" 2>/dev/null) || HTTP_STATUS="000"
+    HTTP_STATUS=$(printf 'header = "X-API-Key: %s"\nheader = "X-Organization-Id: %s"\n' "$key" "$org" |
+      curl -sS -m 25 -o "$tmp" -w '%{http_code}' --config - "$url" 2>/dev/null) || HTTP_STATUS="000"
   else
-    HTTP_STATUS=$(curl -sS -m 25 -o "$tmp" -w '%{http_code}' "$url" \
-      -H "X-API-Key: $key" 2>/dev/null) || HTTP_STATUS="000"
+    HTTP_STATUS=$(printf 'header = "X-API-Key: %s"\n' "$key" |
+      curl -sS -m 25 -o "$tmp" -w '%{http_code}' --config - "$url" 2>/dev/null) || HTTP_STATUS="000"
   fi
   API_BODY=$(cat "$tmp")
   rm -f "$tmp"
@@ -390,6 +659,10 @@ unreachable_msg="could not reach $GATEWAY_HOST. Check your internet connection a
 say "qBraid account"
 API_KEY="${QBRAID_API_KEY:-}"
 KEY_SOURCE="QBRAID_API_KEY"
+if [ -z "$API_KEY" ]; then
+  API_KEY=$(read_profile_secret 2>/dev/null || true)
+  [ -z "$API_KEY" ] || KEY_SOURCE="profile secret store"
+fi
 
 if [ -n "$API_KEY" ]; then
   rc=0; try_key "$API_KEY" || rc=$?
@@ -445,12 +718,40 @@ EOF
 fi
 ok "key accepted (from $KEY_SOURCE)"
 
-# The key and model are written into a file that qbraid-code and statusline.sh
-# both `.` as shell source, so anything exotic in them would be executed.
-# Both are server-controlled strings; validate rather than trust.
+# Keep stored credentials and model identifiers within the gateway's expected
+# character set. They also flow into HTTP and proxy configuration.
 case "$API_KEY" in
   ''|*[!A-Za-z0-9_.-]*) die "the API key contains unexpected characters — refusing to save it." ;;
 esac
+
+prune_profile_generations() { # prune_profile_generations <current-generation>
+  local current="$1" dir env_file backend ref
+  if [ -f "$PROFILE_ROOT/env" ]; then
+    backend=$(sed -n 's/^QBRAID_CODE_SECRET_BACKEND=//p' "$PROFILE_ROOT/env" | head -1)
+    ref=$(sed -n 's/^QBRAID_CODE_SECRET_REF=//p' "$PROFILE_ROOT/env" | head -1)
+    case "$backend:$ref" in
+      secret-service:qbraid-code:"$PROFILE") secret-tool clear service qbraid-code ref "$ref" >/dev/null 2>&1 || true ;;
+      keychain:qbraid-code:"$PROFILE") security delete-generic-password -a "${USER:-$(id -un)}" -s "$ref" >/dev/null 2>&1 || true ;;
+      file:"$HOME_DIR"/secrets/"$PROFILE") rm -f "$ref" ;;
+    esac
+    rm -f "$PROFILE_ROOT/env" "$PROFILE_ROOT/proxy-template.yaml" "$PROFILE_ROOT/label" "$PROFILE_ROOT/label-source" "$PROFILE_ROOT/models.tsv" "$PROFILE_ROOT/credits.cache" "$PROFILE_ROOT/credits.updated" "$PROFILE_ROOT/organization-id"
+  fi
+  for dir in "$PROFILE_ROOT"/generations/*; do
+    [ -d "$dir" ] || continue
+    [ "${dir##*/}" != "$current" ] || continue
+    env_file="$dir/env"; backend=""; ref=""
+    if [ -f "$env_file" ]; then
+      backend=$(sed -n 's/^QBRAID_CODE_SECRET_BACKEND=//p' "$env_file" | head -1)
+      ref=$(sed -n 's/^QBRAID_CODE_SECRET_REF=//p' "$env_file" | head -1)
+      case "$backend:$ref" in
+        secret-service:qbraid-code:"$PROFILE":*) secret-tool clear service qbraid-code ref "$ref" >/dev/null 2>&1 || true ;;
+        keychain:qbraid-code:"$PROFILE":*) security delete-generic-password -a "${USER:-$(id -un)}" -s "$ref" >/dev/null 2>&1 || true ;;
+        file:"$HOME_DIR"/secrets/"$PROFILE".*) rm -f "$ref" ;;
+      esac
+    fi
+    rm -rf "$dir"
+  done
+}
 
 # ------------------------------------------------------- 4. organization check
 
@@ -505,6 +806,11 @@ EOF
 fi
 ok "account confirmed"
 
+OLD_ORG_ID=$(cat "$PROFILE_DIR/organization-id" 2>/dev/null || true)
+if [ -n "$OLD_ORG_ID" ] && { [ -z "$ORG_ID" ] || [ "$OLD_ORG_ID" != "$ORG_ID" ]; }; then
+  die "profile '$PROFILE' belongs to another organization. Use a new profile name."
+fi
+
 if [ "$CREDITS" != unknown ] && awk -v c="$CREDITS_RAW" 'BEGIN { exit !(c <= 0) }'; then
   warn "this organization has no credits left — requests will fail until it is topped up."
 fi
@@ -556,21 +862,38 @@ ok "default model: $MODEL"
 
 # ---------------------------------------------------------------- 6. env file
 
+GENERATION="$(date +%s).$$"
+mkdir -p "$PROFILE_ROOT/generations"
+PROFILE_STAGE="$PROFILE_ROOT/generations/.stage.$$"
+rm -rf "$PROFILE_STAGE"; mkdir "$PROFILE_STAGE"; chmod 700 "$PROFILE_STAGE"
+store_profile_secret
+PROFILE_DIR="$PROFILE_STAGE"
+if [ -n "${QBRAID_CODE_PROFILE_LABEL:-}" ]; then PROFILE_LABEL=$(sanitize_profile_label "$QBRAID_CODE_PROFILE_LABEL" "$PROFILE"); PROFILE_LABEL_SOURCE=local
+elif [ -n "$ORG_NAME" ]; then PROFILE_LABEL=$(sanitize_profile_label "$ORG_NAME" "$PROFILE"); PROFILE_LABEL_SOURCE=verified
+else PROFILE_LABEL="$PROFILE"; PROFILE_LABEL_SOURCE=local; fi
 OLD_UMASK=$(umask)
 umask 077
-cat > "$HOME_DIR/env" <<EOF
+rm -f "$PROFILE_DIR/proxy-config.yaml" "$PROFILE_DIR/proxy-template.yaml" "$PROFILE_DIR/proxy.key"
+rm -rf "$PROFILE_DIR/proxy-auth"
+cat > "$PROFILE_DIR/env" <<EOF
 QBRAID_CODE_BASE_URL=$GATEWAY_URL
 QBRAID_CODE_API_BASE=$API_BASE
-QBRAID_CODE_TOKEN=$API_KEY
 QBRAID_CODE_MODEL=$MODEL
+QBRAID_CODE_SECRET_BACKEND=$SECRET_BACKEND
+QBRAID_CODE_SECRET_REF=$SECRET_REF
 EOF
-chmod 600 "$HOME_DIR/env"
+printf '%s\n' "$PROFILE_LABEL" > "$PROFILE_DIR/label"
+printf '%s\n' "$PROFILE_LABEL_SOURCE" > "$PROFILE_DIR/label-source"
+[ -z "$ORG_ID" ] || printf '%s\n' "$ORG_ID" > "$PROFILE_DIR/organization-id"
+write_models_tsv "$PROFILE_DIR/models.tsv" "${API_BODY:-}"
+chmod 600 "$PROFILE_DIR/env" "$PROFILE_DIR/label" "$PROFILE_DIR/models.tsv" "$PROFILE_DIR/organization-id" 2>/dev/null || true
 umask "$OLD_UMASK"
-# The cached balance belongs to whichever key was configured before. Re-running
-# with a key from a different organization must not keep rendering the old
-# organization's wallet.
-rm -f "$HOME_DIR/credits.cache" "$HOME_DIR/credits.attempt"
-ok "config written to $HOME_DIR/env"
+if [ "$CREDITS_RAW" ]; then
+  printf '%s\n' "$CREDITS_RAW" > "$PROFILE_DIR/credits.cache"
+  date +%s > "$PROFILE_DIR/credits.updated"
+fi
+rm -f "$PROFILE_DIR/credits.attempt"
+ok "profile '$PROFILE' metadata prepared"
 
 # ------------------------------------------------- 7. launcher and statusline
 
@@ -599,13 +922,8 @@ fetch_file() { # fetch_file <name> <dest>
 
 fetch_file qbraid-code "$BIN_DIR/qbraid-code"
 chmod 0755 "$BIN_DIR/qbraid-code"
-# QBRAID_CODE_HOME is resolved once, here, and baked into the installed copies.
-# Re-deriving it at run time meant a non-default install reported success and
-# then could not find its own config in a fresh shell.
-sed "s|^HOME_DIR=.*|HOME_DIR=\"\${QBRAID_CODE_HOME:-$HOME_DIR}\"|" \
-  "$BIN_DIR/qbraid-code" > "$BIN_DIR/qbraid-code.tmp" \
-  && mv "$BIN_DIR/qbraid-code.tmp" "$BIN_DIR/qbraid-code" \
-  && chmod 0755 "$BIN_DIR/qbraid-code"
+printf '%s\n' "$HOME_DIR" > "$BIN_DIR/qbraid-code.home"
+chmod 0600 "$BIN_DIR/qbraid-code.home"
 ok "launcher installed to $BIN_DIR/qbraid-code"
 
 fetch_file statusline.sh "$HOME_DIR/statusline.sh"
@@ -622,30 +940,24 @@ say "GPT models"
 # (CLIProxyAPI >= 7.2.135-ish); an older binary would show the picker reversed
 # pseudo-model gibberish. Feature-detect on the binary itself, not a version
 # number.
-proxy_supports_picker() {
-  # grep -q exits at the first match, strings then dies of SIGPIPE, and
-  # pipefail would turn that into failure-on-success. Same class of bug as
-  # the json extractors; same cure.
-  (
-    set +o pipefail
-    strings "$1" 2>/dev/null | grep -q "disable-cloaking-model-list"
-  )
+proxy_supports_gateway_config() {
+  grep -a -q "disable-cloaking-model-list" "$1" 2>/dev/null
 }
 
 PROXY_BIN=""
 for cand in "$(command -v cliproxyapi 2>/dev/null || true)" "$HOME_DIR/cliproxyapi"; do
   [ -n "$cand" ] && [ -x "$cand" ] || continue
-  if proxy_supports_picker "$cand"; then
+  if proxy_supports_gateway_config "$cand"; then
     PROXY_BIN="$cand"
     ok "using existing $PROXY_BIN"
     break
   fi
-  warn "$cand is too old for the /model picker — upgrading"
+  warn "$cand is too old for the unified gateway config — upgrading"
 done
 if [ -z "$PROXY_BIN" ] && [ "$OS" = darwin ] && command -v brew >/dev/null 2>&1; then
   if brew install cliproxyapi >/dev/null 2>&1 || brew upgrade cliproxyapi >/dev/null 2>&1; then
     CAND="$(command -v cliproxyapi 2>/dev/null || true)"
-    if [ -n "$CAND" ] && proxy_supports_picker "$CAND"; then
+    if [ -n "$CAND" ] && proxy_supports_gateway_config "$CAND"; then
       PROXY_BIN="$CAND"
       ok "proxy installed via Homebrew"
     fi
@@ -661,7 +973,7 @@ if [ -z "$PROXY_BIN" ]; then
     PROXY_TMP=$(mktemp -d)
     if curl -fsSL -m 120 -o "$PROXY_TMP/cpa.tar.gz" "$PROXY_URL" 2>/dev/null \
       && tar xzf "$PROXY_TMP/cpa.tar.gz" -C "$PROXY_TMP" cli-proxy-api 2>/dev/null \
-      && proxy_supports_picker "$PROXY_TMP/cli-proxy-api"; then
+      && proxy_supports_gateway_config "$PROXY_TMP/cli-proxy-api"; then
       install -m 0755 "$PROXY_TMP/cli-proxy-api" "$HOME_DIR/cliproxyapi"
       PROXY_BIN="$HOME_DIR/cliproxyapi"
       ok "proxy installed to $PROXY_BIN"
@@ -675,44 +987,37 @@ if [ -n "$PROXY_BIN" ]; then
   # The gateway's OpenAI-compat surface lists every model; only the gpt-* ones
   # need the proxy — Claude models go to the Anthropic surface directly.
   api_get "$GATEWAY_URL/models" "$API_KEY"
+  write_models_tsv "$PROFILE_DIR/models.tsv" "${API_BODY:-}"
+  chmod 600 "$PROFILE_DIR/models.tsv"
   GPT_MODELS=$(set +o pipefail; printf '%s' "$API_BODY" | grep -o '"id":"gpt-[^"]*"' | sed 's/"id":"//; s/"$//')
-  if [ -z "$GPT_MODELS" ]; then
-    warn "could not list GPT models from the gateway — skipping proxy config"
+  CLAUDE_MODELS=$(set +o pipefail; printf '%s' "$API_BODY" | grep -o '"id":"claude-[^"]*"' | sed 's/"id":"//; s/"$//')
+  if [ -z "$GPT_MODELS$CLAUDE_MODELS" ]; then
+    die "could not list proxy models from the gateway; the profile was not changed."
   else
-    if [ ! -s "$HOME_DIR/proxy.key" ]; then
-      # Loopback bearer so only processes on this machine can use the proxy.
-      OLD_UMASK=$(umask); umask 077
-      od -An -tx1 -N 24 /dev/urandom | tr -d ' \n' > "$HOME_DIR/proxy.key"
-      umask "$OLD_UMASK"
-    fi
-    PROXY_LOCAL_KEY=$(cat "$HOME_DIR/proxy.key")
     # One proxy, every model: Claude models pass through to the Anthropic
     # surface untouched (claude-api-key with a custom base-url), GPT models are
     # translated to the OpenAI surface. The proxy's /v1/models then lists all
     # of them, and one base URL serves any `--model`.
-    CLAUDE_MODELS=$(set +o pipefail; printf '%s' "$API_BODY" | grep -o '"id":"claude-[^"]*"' | sed 's/"id":"//; s/"$//')
     OLD_UMASK=$(umask); umask 077
     {
       cat <<PEOF
 # Generated by the qbraid-code installer. Loopback only.
 host: "127.0.0.1"
-port: $PROXY_PORT
+port: __PORT__
 tls:
   enable: false
-auth-dir: "$HOME_DIR/proxy-auth"
+auth-dir: "__AUTH_DIR__"
 api-keys:
-  - "$PROXY_LOCAL_KEY"
+  - "__LOCAL_KEY__"
 remote-management:
   allow-remote: false
   disable-control-panel: true
 debug: false
-# Model-list cloaking rewrites ids into reversed pseudo-claude names so they
-# pass Claude Code's discovery filter — the picker then shows gibberish. Our
-# anthropic-compat/ aliases pass the filter with readable names instead.
+# Keep model identifiers stable for explicit --model launches.
 claude-code:
   disable-cloaking-model-list: true
 claude-api-key:
-  - api-key: "$API_KEY"
+  - api-key: "__QBRAID_KEY__"
     base-url: "$GATEWAY_URL"
     models:
 PEOF
@@ -725,29 +1030,22 @@ openai-compatibility:
   - name: "qbraid-gateway-gpt"
     base-url: "$GATEWAY_URL"
     api-key-entries:
-      - api-key: "$API_KEY"
+      - api-key: "__QBRAID_KEY__"
     models:
 PEOF
       printf '%s\n' "$GPT_MODELS" | while IFS= read -r gm; do
         [ -n "$gm" ] || continue
-        # Two aliases per GPT model: the plain id for the command line, and a
-        # prefixed one containing "anthropic" so Claude Code's /model picker
-        # discovery filter (which keeps only ids containing claude|anthropic)
-        # shows it. The alias IS the inference mapping — selecting the
-        # prefixed row routes to the same upstream model.
         printf '      - name: "%s"\n        alias: "%s"\n' "$gm" "$gm"
-        printf '      - name: "%s"\n        alias: "anthropic-compat/%s"\n' "$gm" "$gm"
       done
-    } > "$HOME_DIR/proxy-config.yaml"
-    chmod 600 "$HOME_DIR/proxy-config.yaml"
+    } > "$PROFILE_DIR/proxy-template.yaml"
+    chmod 600 "$PROFILE_DIR/proxy-template.yaml"
     umask "$OLD_UMASK"
-    mkdir -p "$HOME_DIR/proxy-auth"
     GPT_COUNT=$(printf '%s\n' "$GPT_MODELS" | wc -l | tr -d ' ')
     CLAUDE_COUNT=$(printf '%s\n' "$CLAUDE_MODELS" | wc -l | tr -d ' ')
     ok "proxy configured: all $((GPT_COUNT + CLAUDE_COUNT)) models on one endpoint (starts on demand)"
   fi
 else
-  warn "CLIProxyAPI unavailable — GPT models will not work; Claude models are unaffected."
+  die "CLIProxyAPI unavailable; the profile was not changed."
 fi
 
 # Appended here rather than written in section 6: PROXY_BIN does not exist yet
@@ -755,7 +1053,18 @@ fi
 {
   printf 'QBRAID_CODE_PROXY_PORT=%s\n' "$PROXY_PORT"
   printf 'QBRAID_CODE_PROXY_BIN=%s\n' "$PROXY_BIN"
-} >> "$HOME_DIR/env"
+} >> "$PROFILE_DIR/env"
+
+FINAL_GENERATION="$PROFILE_ROOT/generations/$GENERATION"
+mv "$PROFILE_STAGE" "$FINAL_GENERATION"
+PROFILE_STAGE=""
+printf '%s\n' "$GENERATION" > "$PROFILE_ROOT/current.tmp.$$"
+mv "$PROFILE_ROOT/current.tmp.$$" "$PROFILE_ROOT/current"
+SECRET_STAGED=0
+PROFILE_DIR="$FINAL_GENERATION"
+prune_profile_generations "$GENERATION"
+scrub_legacy_token "$HOME_DIR"
+ok "profile '$PROFILE' metadata committed"
 
 # --------------------------------------------------------- 8. first-run flags
 
@@ -793,52 +1102,26 @@ fi
 
 # ------------------------------------------------------------ 9. settings.json
 
-# The statusline (and, with --global, the gateway env) go into the user
-# settings file. Exit codes are distinct so the caller can say what actually
+# The statusline goes into the user settings file. Exit codes are distinct so the caller can say what actually
 # went wrong: 2 = no python3, 3 = python3 ran and failed.
 write_settings() {
-  local statusline_cmd="$1"
+  local statusline_cmd="$1" statusline_json
+  statusline_json=$(json_escape_value "$statusline_cmd")
   if [ ! -f "$SETTINGS" ]; then
-    if [ "$GLOBAL" = 1 ]; then
-      cat > "$SETTINGS" <<EOF
+    cat > "$SETTINGS" <<EOF
 {
-  "env": {
-    "ANTHROPIC_BASE_URL": "$GATEWAY_URL",
-    "ANTHROPIC_AUTH_TOKEN": "$API_KEY",
-    "ANTHROPIC_MODEL": "$MODEL",
-    "ANTHROPIC_SMALL_FAST_MODEL": "$MODEL",
-    "MAX_THINKING_TOKENS": "0"
-  },
-  "statusLine": { "type": "command", "command": "'$statusline_cmd'" }
+  "statusLine": { "type": "command", "command": "$statusline_json" }
 }
 EOF
-    else
-      cat > "$SETTINGS" <<EOF
-{
-  "statusLine": { "type": "command", "command": "'$statusline_cmd'" }
-}
-EOF
-    fi
     return 0
   fi
-
   have_python || return 2
-  QC_STATUSLINE="'$statusline_cmd'" QC_GLOBAL="$GLOBAL" QC_BASE_URL="$GATEWAY_URL" \
-  QC_TOKEN="$API_KEY" QC_MODEL="$MODEL" python3 - "$SETTINGS" <<'PY' || return 3
+  QC_STATUSLINE="$statusline_cmd" python3 - "$SETTINGS" <<'PY' || return 3
 import json, os, sys
 path = sys.argv[1]
 with open(path) as fh:
     data = json.load(fh)
 data["statusLine"] = {"type": "command", "command": os.environ["QC_STATUSLINE"]}
-if os.environ["QC_GLOBAL"] == "1":
-    env = data.setdefault("env", {})
-    env["ANTHROPIC_BASE_URL"] = os.environ["QC_BASE_URL"]
-    env["ANTHROPIC_AUTH_TOKEN"] = os.environ["QC_TOKEN"]
-    env["ANTHROPIC_MODEL"] = os.environ["QC_MODEL"]
-    env["ANTHROPIC_SMALL_FAST_MODEL"] = os.environ["QC_MODEL"]
-    # The gateway rejects Claude Code's adaptive-thinking parameter; see the
-    # launcher for the full note. Remove when the gateway accepts "adaptive".
-    env["MAX_THINKING_TOKENS"] = "0"
 tmp = path + ".qbraid-code.tmp"
 with open(tmp, "w") as fh:
     json.dump(data, fh, indent=2)
@@ -851,27 +1134,19 @@ say "Statusline"
 # The path is single-quoted inside the JSON string so a HOME_DIR containing a
 # space is still one argument when Claude Code runs it through a shell.
 set +e
-write_settings "$HOME_DIR/statusline.sh"
+STATUSLINE_COMMAND=$(shell_quote "$HOME_DIR/statusline.sh")
+write_settings "$STATUSLINE_COMMAND"
 SETTINGS_RC=$?
 set -e
 case "$SETTINGS_RC" in
-  0)
-    ok "statusline enabled in $SETTINGS"
-    if [ "$GLOBAL" = 1 ]; then
-      # It now holds a live credential; the env file is already 600.
-      chmod 600 "$SETTINGS" 2>/dev/null || warn "could not tighten permissions on $SETTINGS"
-      GLOBAL_APPLIED=1
-      ok "plain \`claude\` now uses qBraid too"
-    fi
-    ;;
+  0) ok "statusline enabled in $SETTINGS" ;;
   2) warn "python3 unavailable and $SETTINGS already exists — skipping." ;;
   3) warn "could not update $SETTINGS (it may not be valid JSON) — skipping." ;;
 esac
 if [ "$SETTINGS_RC" != 0 ]; then
   warn "add this to it by hand to enable the statusline:"
-  printf '      %s"statusLine": { "type": "command", "command": "'"'"'%s'"'"'" }%s\n' \
-    "$dim" "$HOME_DIR/statusline.sh" "$rst"
-  [ "$GLOBAL" = 1 ] && warn "--global was NOT applied; plain \`claude\` is unchanged."
+  printf '      %s"statusLine": { "type": "command", "command": "%s" }%s\n' \
+    "$dim" "$(json_escape_value "$STATUSLINE_COMMAND")" "$rst"
 fi
 
 # ------------------------------------------------------------------- 10. mcp
@@ -920,8 +1195,8 @@ fi
 # dies. The commonest cause is an empty wallet, which is not a broken setup.
 say "Verifying"
 SMOKE_TMP=$(mktemp)
-SMOKE_STATUS=$(curl -sS -m 90 -o "$SMOKE_TMP" -w '%{http_code}' "$GATEWAY_URL/v1/messages" \
-  -H "Authorization: Bearer $API_KEY" \
+SMOKE_STATUS=$(printf 'header = "Authorization: Bearer %s"\n' "$API_KEY" |
+  curl -sS -m 90 -o "$SMOKE_TMP" -w '%{http_code}' --config - "$GATEWAY_URL/v1/messages" \
   -H "anthropic-version: 2023-06-01" \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: OK\"}]}" \
@@ -941,6 +1216,9 @@ esac
 
 # ---------------------------------------------------------------- 12. finish
 
+printf '%s\n' "$PROFILE" > "$HOME_DIR/active-profile.tmp.$$"
+mv "$HOME_DIR/active-profile.tmp.$$" "$HOME_DIR/active-profile"
+
 printf '\n%sqbraid-code is ready.%s\n\n' "$bold$grn" "$rst"
 
 case ":$PATH:" in
@@ -948,9 +1226,7 @@ case ":$PATH:" in
   *)
     SHELL_RC="$HOME/.bashrc"
     case "${SHELL:-}" in *zsh) SHELL_RC="$HOME/.zshrc" ;; esac
-    printf '  %sFirst, add %s to your PATH:%s\n' "$ylw" "$BIN_DIR" "$rst"
-    printf '    echo '"'"'export PATH="%s:$PATH"'"'"' >> %s\n' "$BIN_DIR" "$SHELL_RC"
-    printf '    source %s\n\n' "$SHELL_RC"
+    printf '  %sAdd %s to PATH in %s, then open a new shell.%s\n\n' "$ylw" "$BIN_DIR" "$SHELL_RC" "$rst"
     ;;
 esac
 
@@ -962,8 +1238,4 @@ cat <<EOF
     ${bold}qbraid-code --doctor${rst}        check your setup
 
 EOF
-if [ "$GLOBAL_APPLIED" = 1 ]; then
-  printf '  The plain %sclaude%s command uses qBraid as well.\n\n' "$bold" "$rst"
-else
-  printf '  Your own %sclaude%s command is untouched.\n\n' "$bold" "$rst"
-fi
+printf '  Your own %sclaude%s command is untouched.\n\n' "$bold" "$rst"

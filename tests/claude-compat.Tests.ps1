@@ -10,6 +10,7 @@ if ($errors) { throw "could not parse install.ps1: $errors" }
 $needed = @(
     'ConvertFrom-ClaudeVersionString',
     'Compare-ClaudeVersion',
+    'Test-ClaudeUpgradeSafe',
     'Get-ClaudeVersionStatus',
     'Get-ClaudePolicyAction',
     'Test-ClaudeMcpCommand',
@@ -57,6 +58,8 @@ Assert-Equal 'older version compares below' (Compare-ClaudeVersion '2.1.185' '2.
 Assert-Equal 'equal version compares equal' (Compare-ClaudeVersion '2.1.186' '2.1.186') 0
 Assert-Equal 'newer patch compares above' (Compare-ClaudeVersion '2.1.238' '2.1.186') 1
 Assert-Equal 'newer minor compares above' (Compare-ClaudeVersion '2.2.0' '2.1.999') 1
+Assert-Equal 'stable target allows an upgrade' (Test-ClaudeUpgradeSafe '2.1.185' '2.1.228') $true
+Assert-Equal 'stable target refuses a tested-range downgrade' (Test-ClaudeUpgradeSafe '2.1.238' '2.1.228') $false
 
 Assert-Equal 'unknown version status' (Get-ClaudeVersionStatus $null) 'unknown'
 Assert-Equal 'below minimum status' (Get-ClaudeVersionStatus '2.1.185') 'below-minimum'

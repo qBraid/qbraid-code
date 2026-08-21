@@ -5,6 +5,16 @@ set -euo pipefail
 version=$(claude --version)
 printf 'claude: %s\n' "$version"
 
+cli_help=$(claude --help)
+for option in --settings --setting-sources --strict-mcp-config; do
+  printf '%s
+' "$cli_help" | grep -Fq -- "$option" || {
+    printf 'missing required isolation option: %s
+' "$option" >&2
+    exit 1
+  }
+done
+
 help=$(claude mcp --help)
 for command in add get; do
   printf '%s\n' "$help" | grep -Eq "^[[:space:]]+$command([[:space:]]|$)" || {
@@ -29,4 +39,4 @@ printf '%s\n' "$add_help" | grep -Eq -- '--scope.*user' || {
   exit 1
 }
 
-printf 'Claude Code MCP compatibility checks passed\n'
+printf 'Claude Code compatibility checks passed\n'

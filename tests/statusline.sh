@@ -17,6 +17,9 @@ QBRAID_CODE_API_BASE=https://example.invalid/api/v1
 QBRAID_CODE_TOKEN=
 QBRAID_CODE_MODEL=claude-opus-5
 EOF
+printf 'Research Lab\n' > "$TMP/label"
+printf 'local\n' > "$TMP/label-source"
+date +%s > "$TMP/credits.updated"
 
 pass=0; fail=0
 render() { printf '%s' "$1" | bash statusline.sh 2>/dev/null; }
@@ -35,6 +38,16 @@ check() { # check <name> <payload> <regex>
 FULL='{"model":{"display_name":"Claude Opus 5"},"workspace":{"current_dir":"/tmp"},"context_window":{"remaining_percentage":87}}'
 
 check "model name renders"       "$FULL" 'Claude Opus 5'
+check "qBraid identity renders"  "$FULL" 'qBraid Research Lab'
+printf 'org-123456789\n' > "$TMP/organization-id"
+check "verified organization ID accompanies local label" "$FULL" 'Research Lab \(local · org org-1234…\)'
+rm -f "$TMP/organization-id"
+raw_brand=$(render "$FULL")
+if printf '%s' "$raw_brand" | grep -q "$(printf '\033')\[38;2;168;85;247mqBraid"; then
+  pass=$((pass + 1)); printf '  ok   qBraid uses one violet accent\n'
+else
+  fail=$((fail + 1)); printf '  FAIL qBraid violet accent missing\n'
+fi
 check "context 87 pct -> C13"    "$FULL" 'C13'
 check "one filled block"         "$FULL" '█░░░░░'
 check "100 pct remaining -> C0"  '{"context_window":{"remaining_percentage":100},"workspace":{"current_dir":"/tmp"}}' 'C0'
@@ -60,27 +73,22 @@ check "zero credits renders" "$FULL" '0 credits'
 printf '4281.4' > "$TMP/credits.cache"
 check "credits are rounded"  "$FULL" '4281 credits'
 
-# file_age must work on THIS platform. `stat -f %m` is BSD-only and on GNU
-# coreutils fails while still printing to stdout, which froze the balance
-# forever. With a fresh attempt stamp no refresh is due; if file_age is broken
-# the script cannot tell, so assert it reads back a sane age.
-: > "$TMP/credits.attempt"
-# Defined as a function, not inlined into $( ): bash 3.2 (which macOS still
-# ships) cannot parse `case ... esac` inside a command substitution.
-probe_mtime() {
-  local m=""
-  m=$(stat -c %Y "$1" 2>/dev/null) || m=$(stat -f %m "$1" 2>/dev/null) || return 1
-  [ -n "$m" ] || return 1
-  case "$m" in
-    *[!0-9]*) return 1 ;;
-  esac
-  echo $(( $(date +%s) - m ))
-}
-
-if age_probe=$(probe_mtime "$TMP/credits.attempt") && [ "$age_probe" -lt 5 ]; then
-  pass=$((pass + 1)); printf '  ok   file mtime readable on %s (age %ss)\n' "$(uname -s)" "$age_probe"
+printf '%s
+' "$(( $(date +%s) - 600 ))" > "$TMP/credits.updated"
+check "stale credits are marked" "$FULL" '4281 credits · stale 10m'
+date +%s > "$TMP/credits.updated"
+if ! render "$FULL" | strip_ansi | grep -q stale; then
+  pass=$((pass + 1)); printf '  ok   fresh credits are not marked stale\n'
 else
-  fail=$((fail + 1)); printf '  FAIL file mtime unreadable on %s\n' "$(uname -s)"
+  fail=$((fail + 1)); printf '  FAIL fresh credits marked stale\n'
+fi
+
+if grep -E -- '-H[[:space:]]+"[^"$]*\$(TOKEN|API_KEY)' statusline.sh install.sh qbraid-code >/dev/null; then
+  fail=$((fail + 1)); printf '  FAIL API key appears in a process argument\n'
+elif ! grep -q 'QBRAID_CODE_TOKEN' statusline.sh && grep -q -- '--config -' install.sh; then
+  pass=$((pass + 1)); printf '  ok   API keys use curl config stdin, not process arguments\n'
+else
+  fail=$((fail + 1)); printf '  FAIL secret-free curl transport missing\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

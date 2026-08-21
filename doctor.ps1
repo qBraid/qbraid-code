@@ -5,9 +5,19 @@
 # No Set-StrictMode: this command exists to report a broken setup, so a missing
 # field must print a diagnosis rather than a PowerShell exception.
 $ErrorActionPreference = 'Continue'
+$null = [Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]
+$null = [Windows.Security.Credentials.PasswordCredential,Windows.Security.Credentials,ContentType=WindowsRuntime]
 
 $HomeDir = if ($env:QBRAID_CODE_HOME) { $env:QBRAID_CODE_HOME } else { Join-Path $env:USERPROFILE '.qbraid-code' }
-$envPath = Join-Path $HomeDir 'env'
+$ProfileDir = $env:QBRAID_CODE_PROFILE_HOME
+if (-not $ProfileDir) {
+    $profile = $env:QBRAID_CODE_PROFILE
+    if (-not $profile -and (Test-Path (Join-Path $HomeDir 'active-profile'))) { $profile = (Get-Content (Join-Path $HomeDir 'active-profile') -Raw).Trim() }
+    if (-not $profile) { $profile = 'default' }
+    $ProfileDir = Join-Path (Join-Path $HomeDir 'profiles') $profile
+    if (-not (Test-Path (Join-Path $ProfileDir 'env')) -and $profile -eq 'default') { $ProfileDir = $HomeDir }
+}
+$envPath = Join-Path $ProfileDir 'env'
 
 if (-not (Test-Path $envPath)) {
     Write-Host "qbraid-code: not installed - no $envPath"
@@ -22,6 +32,14 @@ foreach ($line in Get-Content $envPath) {
 $apiBase = $settings['QBRAID_CODE_API_BASE']
 $baseUrl = $settings['QBRAID_CODE_BASE_URL']
 $token   = $settings['QBRAID_CODE_TOKEN']
+if (-not $token -and $settings['QBRAID_CODE_SECRET_BACKEND'] -eq 'credential-locker') {
+    try {
+        $vault = New-Object Windows.Security.Credentials.PasswordVault
+        $credential = $vault.Retrieve($settings['QBRAID_CODE_SECRET_REF'], $env:USERNAME)
+        $credential.RetrievePassword()
+        $token = $credential.Password
+    } catch { }
+}
 $model   = $settings['QBRAID_CODE_MODEL']
 $claudeMinVersion = '2.1.186'
 $claudeTestedMax  = '2.1.238'
@@ -141,8 +159,7 @@ Write-Host "model:    $model"
 
 $proxyBin = $settings['QBRAID_CODE_PROXY_BIN']
 if ($proxyBin -and (Test-Path $proxyBin)) {
-    $st = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $HomeDir 'qbraid-proxy.ps1') status 2>$null
-    Write-Host "gpt:      proxy $st"
+    Write-Host 'proxy:    installed (starts once per launch)'
 } else {
-    Write-Host 'gpt:      NOT AVAILABLE - re-run the installer to add GPT models'
+    Write-Host 'proxy:    NOT AVAILABLE - re-run the installer'
 }

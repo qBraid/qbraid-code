@@ -14,7 +14,7 @@ extract_fn() { # extract_fn <name>
 }
 
 FUNCTIONS=""
-for fn in parse_claude_version compare_versions claude_version_status \
+for fn in parse_claude_version compare_versions claude_upgrade_is_safe claude_version_status \
   claude_policy_action claude_supports_mcp_command \
   claude_supports_mcp_http claude_supports_mcp_user_scope; do
   src=$(extract_fn "$fn")
@@ -49,6 +49,10 @@ check_eq "older version compares below" -1 "compare_versions 2.1.185 2.1.186"
 check_eq "equal version compares equal" 0 "compare_versions 2.1.186 2.1.186"
 check_eq "newer patch compares above" 1 "compare_versions 2.1.238 2.1.186"
 check_eq "newer minor compares above" 1 "compare_versions 2.2.0 2.1.999"
+check_eq "stable target allows an upgrade" safe \
+  "claude_upgrade_is_safe 2.1.185 2.1.228 && printf safe || printf downgrade"
+check_eq "stable target refuses a tested-range downgrade" downgrade \
+  "claude_upgrade_is_safe 2.1.238 2.1.228 && printf safe || printf downgrade"
 
 check_eq "unknown version status" unknown "claude_version_status ''"
 check_eq "below minimum status" below-minimum "claude_version_status 2.1.185"

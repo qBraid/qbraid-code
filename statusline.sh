@@ -7,21 +7,32 @@
 set -uo pipefail
 
 HOME_DIR="${QBRAID_CODE_HOME:-$HOME/.qbraid-code}"
-CACHE="$HOME_DIR/credits.cache"
-# Stamped before each refresh ATTEMPT, not after a success. Without it a
-# failing balance call (revoked key, no network) leaves the cache untouched,
-# so every render decides a refresh is due and spawns another background
-# curl — several per second, for the whole session.
-ATTEMPT="$HOME_DIR/credits.attempt"
-TTL=60
-
-[ -f "$HOME_DIR/env" ] && . "$HOME_DIR/env"
-API_BASE="${QBRAID_CODE_API_BASE:-https://api-v2.qbraid.com/api/v1}"
-TOKEN="${QBRAID_CODE_TOKEN:-}"
+PROFILE_HOME="${QBRAID_CODE_PROFILE_HOME:-}"
+if [ -z "$PROFILE_HOME" ]; then
+  if [ -f "$HOME_DIR/env" ]; then
+    PROFILE_HOME="$HOME_DIR"
+  elif [ -f "$HOME_DIR/active-profile" ]; then
+    IFS= read -r profile < "$HOME_DIR/active-profile" || true
+    if [ -n "${profile:-}" ]; then
+      PROFILE_HOME="$HOME_DIR/profiles/$profile"
+      if [ -f "$PROFILE_HOME/current" ]; then
+        IFS= read -r generation < "$PROFILE_HOME/current" || true
+        case "${generation:-}" in ''|*/*|.*) ;; *) PROFILE_HOME="$PROFILE_HOME/generations/$generation" ;; esac
+      fi
+    fi
+  fi
+fi
+[ -n "$PROFILE_HOME" ] || PROFILE_HOME="$HOME_DIR"
+CACHE="$PROFILE_HOME/credits.cache"
+UPDATED="$PROFILE_HOME/credits.updated"
+PROFILE_LABEL=$(cat "$PROFILE_HOME/label" 2>/dev/null || printf '%s' "${QBRAID_CODE_PROFILE:-default}")
+PROFILE_LABEL=$(printf '%s' "$PROFILE_LABEL" | tr -d '\001-\037\177')
+LABEL_BYTES=$(LC_ALL=C printf '%s' "$PROFILE_LABEL" | wc -c | tr -d ' ')
+[ -n "$PROFILE_LABEL" ] && [ "$LABEL_BYTES" -le 80 ] || PROFILE_LABEL="${QBRAID_CODE_PROFILE:-default}"
 
 esc=$(printf '\033')
 dim="${esc}[2m"; rst="${esc}[0m"
-cyan="${esc}[36m"; grn="${esc}[32m"; ylw="${esc}[33m"; red="${esc}[31m"
+violet="${esc}[38;2;168;85;247m"; grn="${esc}[32m"; ylw="${esc}[33m"; red="${esc}[31m"
 
 payload=$(cat)
 
@@ -40,7 +51,7 @@ remaining=$(number remaining_percentage)
 
 name=$(basename "$dir")
 branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-place="${cyan}${name}${rst}"
+place="${name}"
 if [ -n "$branch" ] && [ "$branch" != HEAD ]; then
   if [ "${#branch}" -gt 22 ]; then branch="${branch:0:21}…"; fi
   place="${place} ${dim}⎇ ${branch}${rst}"
@@ -67,47 +78,27 @@ fi
 
 # ----------------------------------------------------------------- credits
 
-# `stat -f %m` is BSD. On GNU coreutils `-f` means --file-system, so the
-# command FAILS but still prints a filesystem block to stdout — the exit
-# status alone does not tell you it went wrong. Try the GNU form first and
-# reject any answer that is not a plain integer.
-file_age() { # file_age <path> — seconds since last modification
-  local mtime=""
-  mtime=$(stat -c %Y "$1" 2>/dev/null) || mtime=$(stat -f %m "$1" 2>/dev/null) || return 1
-  case "$mtime" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  echo $(( $(date +%s) - mtime ))
-}
-
-# Refresh out of band so the prompt never waits on the network.
-refresh_credits() {
-  [ -n "$TOKEN" ] || return 0
-  : > "$ATTEMPT" 2>/dev/null || return 0
-  (
-    body=$(curl -fsS -m 15 "$API_BASE/billing/credits/balance" -H "X-API-Key: $TOKEN" 2>/dev/null) || exit 0
-    value=$(printf '%s' "$body" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
-    [ -n "$value" ] || exit 0
-    printf '%s' "$value" > "$CACHE.tmp.$$" && mv "$CACHE.tmp.$$" "$CACHE"
-  ) >/dev/null 2>&1 &
-}
-
 credits=""
 [ -s "$CACHE" ] && credits=$(cat "$CACHE" 2>/dev/null)
-
-age=$(file_age "$ATTEMPT" 2>/dev/null) || age=""
-if [ -z "$age" ] || [ "$age" -ge "$TTL" ]; then
-  refresh_credits
+updated=$(cat "$UPDATED" 2>/dev/null || true)
+case "$updated" in ''|*[!0-9]*) stale="stale" ;; *)
+  age=$(( $(date +%s) - updated ))
+  if [ "$age" -gt 300 ]; then stale="stale $((age / 60))m"; else stale=""; fi ;;
+esac
+label_source=$(cat "$PROFILE_HOME/label-source" 2>/dev/null || printf 'local')
+if [ "$label_source" = local ]; then
+  org_tag=$(cat "$PROFILE_HOME/organization-id" 2>/dev/null || true)
+  case "$org_tag" in ''|*[!A-Za-z0-9._-]*) PROFILE_LABEL="$PROFILE_LABEL (local)" ;; *) PROFILE_LABEL="$PROFILE_LABEL (local · org $(printf '%s' "$org_tag" | cut -c1-8)…)" ;; esac
 fi
-
-credit_seg=""
+account_seg="${violet}qBraid${rst} ${PROFILE_LABEL}"
 if [ -n "$credits" ]; then
   pretty=$(awk -v c="$credits" 'BEGIN { printf "%.0f", c }' 2>/dev/null)
   [ -n "$pretty" ] || pretty="$credits"
   colour="$grn"
   awk -v c="$credits" 'BEGIN { exit !(c < 100) }' && colour="$ylw"
   awk -v c="$credits" 'BEGIN { exit !(c < 10) }'  && colour="$red"
-  credit_seg="${colour}${pretty}${rst}${dim} credits${rst}"
+  stale_suffix=""; [ -z "$stale" ] || stale_suffix=" · $stale"
+  account_seg="${account_seg}${dim} · ${rst}${colour}${pretty}${rst}${dim} credits${stale_suffix}${rst}"
 fi
 
 # ------------------------------------------------------------------ render
@@ -115,7 +106,7 @@ fi
 sep="${dim} │ ${rst}"
 out="$place${sep}${dim}${model}${rst}"
 [ -n "$bar" ] && out="${out}${sep}${bar}"
-[ -n "$credit_seg" ] && out="${out}${sep}${credit_seg}"
+out="${out}${sep}${account_seg}"
 # %s, not %b: the directory name comes from the session payload and must not
 # have backslash escapes re-interpreted into terminal control sequences. The
 # colours above are already literal ESC bytes and are unaffected.
