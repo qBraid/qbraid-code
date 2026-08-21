@@ -18,6 +18,15 @@ function Get-VaultPassword {
     return $credential.Password
 }
 
+function Test-MissingCredential([object]$ErrorRecord) {
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        if ($exception.HResult -eq -2147023728) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
 function Invoke-TestInstaller {
     param([string[]]$Arguments, [string]$ApiKey = '', [string]$PromptKey = '', [switch]$FailMcp)
     $env:QBRAID_API_KEY = $ApiKey
@@ -131,7 +140,7 @@ exit $LASTEXITCODE
     $rotatedGeneration = Split-Path $rotatedDir -Leaf
     $rotatedRef = ((Get-Content (Join-Path $rotatedDir 'env')) | Where-Object { $_ -like 'QBRAID_CODE_SECRET_REF=*' }).Substring('QBRAID_CODE_SECRET_REF='.Length)
     if ($rotatedGeneration -eq $firstGeneration -or (Get-VaultPassword $rotatedRef) -ne 'test-replacement-secret') { throw 'rotation did not commit the replacement secret' }
-    try { $null = $vault.Retrieve($firstRef, $env:USERNAME); throw 'retired Credential Locker secret remains' } catch { if ($_.Exception.HResult -ne -2147023728) { throw } }
+    try { $null = $vault.Retrieve($firstRef, $env:USERNAME); throw 'retired Credential Locker secret remains' } catch { if (-not (Test-MissingCredential $_)) { throw } }
     if ((Get-Content (Join-Path $rotatedDir 'organization-id') -Raw).Trim() -ne 'org-alpha') { throw 'organization binding was not preserved' }
     if ((Get-Content (Join-Path $rotatedDir 'label') -Raw).Trim() -ne 'Local Lab' -or (Get-Content (Join-Path $rotatedDir 'label-source') -Raw).Trim() -ne 'local') { throw 'rotation changed the profile label' }
     if ((Get-Content (Join-Path $rotatedDir 'env') -Raw) -notmatch 'QBRAID_CODE_MODEL=claude-opus-5') { throw 'rotation changed the model' }
