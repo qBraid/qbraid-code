@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('qbraid-lifecycle-' + [guid]::NewGuid().ToString('N'))
+$tmp = Join-Path $PSScriptRoot ('.qbraid-lifecycle-' + [guid]::NewGuid().ToString('N'))
 $originalUserProfile = $env:USERPROFILE
 $originalHome = $env:QBRAID_CODE_HOME
 $pass = 0
@@ -9,6 +9,8 @@ $fail = 0
 $vault = $null
 $credentialResource = ''
 $invalidCredentialResource = ''
+$null = [Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]
+$null = [Windows.Security.Credentials.PasswordCredential,Windows.Security.Credentials,ContentType=WindowsRuntime]
 
 function Pass([string]$Name) { $script:pass++; Write-Output "  ok   $Name" }
 function Fail([string]$Name) { $script:fail++; Write-Output "  FAIL $Name" }
@@ -258,6 +260,7 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     Copy-Item (Join-Path $root 'qbraid-launch.ps1') (Join-Path $invalidBin 'qbraid-launch.ps1')
     Write-Utf8 (Join-Path $invalidBin 'qbraid-code.home') "$invalidHome`n"
     Write-Utf8 (Join-Path $invalidProfile '.claude\settings.json') '{not-json'
+    $vault = New-Object Windows.Security.Credentials.PasswordVault
     $invalidCredential = New-Object Windows.Security.Credentials.PasswordCredential -ArgumentList $invalidCredentialResource, $env:USERNAME, 'local-secret'
     $vault.Add($invalidCredential)
     $env:USERPROFILE = $invalidProfile
@@ -280,7 +283,6 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     $credentialResource = 'qbraid-code:lifecycle-' + [guid]::NewGuid().ToString('N') + ':g1'
     New-Profile $homeDir 'credential-locker' $credentialResource
     Write-Utf8 (Join-Path $homeDir 'statusline.ps1') "Write-Output 'status'`n"
-    $vault = New-Object Windows.Security.Credentials.PasswordVault
     $credential = New-Object Windows.Security.Credentials.PasswordCredential -ArgumentList $credentialResource, $env:USERNAME, 'local-test-secret'
     $vault.Add($credential)
 

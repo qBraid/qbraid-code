@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('qbraid-native-installer-' + [guid]::NewGuid().ToString('N'))
+$tmp = Join-Path $PSScriptRoot ('.qbraid-native-installer-' + [guid]::NewGuid().ToString('N'))
 $originalUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $vault = $null
 
