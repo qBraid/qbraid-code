@@ -52,19 +52,19 @@ check "json_num still extracts a present number" \
 check "json_str on an empty body survives set -e" \
   "x=\$(json_str '' name); [ -z \"\$x\" ]"
 
-# proxy_supports_picker: grep -q + pipefail must not fail on success.
-FN2=$(awk '/^proxy_supports_picker\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' install.sh)
-if [ -n "$FN2" ] && bash -c "set -euo pipefail; $FN2; proxy_supports_picker /bin/ls || true; exit 0"; then
+# proxy_supports_gateway_config: grep -q + pipefail must not fail on success.
+FN2=$(awk '/^proxy_supports_gateway_config\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' install.sh)
+if [ -n "$FN2" ] && bash -c "set -euo pipefail; $FN2; proxy_supports_gateway_config /bin/ls || true; exit 0"; then
   # positive case: a file that certainly contains the marker
   tmpbin=$(mktemp); printf 'xx disable-cloaking-model-list yy' > "$tmpbin"
-  if bash -c "set -euo pipefail; $FN2; proxy_supports_picker '$tmpbin'"; then
-    pass=$((pass + 1)); printf '  ok   proxy_supports_picker survives pipefail\n'
+  if bash -c "set -euo pipefail; $FN2; proxy_supports_gateway_config '$tmpbin'"; then
+    pass=$((pass + 1)); printf '  ok   proxy_supports_gateway_config survives pipefail\n'
   else
-    fail=$((fail + 1)); printf '  FAIL proxy_supports_picker false-negative under pipefail\n'
+    fail=$((fail + 1)); printf '  FAIL proxy_supports_gateway_config false-negative under pipefail\n'
   fi
   rm -f "$tmpbin"
 else
-  fail=$((fail + 1)); printf '  FAIL proxy_supports_picker extraction or negative case\n'
+  fail=$((fail + 1)); printf '  FAIL proxy_supports_gateway_config extraction or negative case\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

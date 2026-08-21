@@ -1,11 +1,10 @@
 <#
 .SYNOPSIS
-  Manages the loopback CLIProxyAPI that gives qbraid-code its GPT models.
+  Manages one launch-owned loopback CLIProxyAPI process.
 
 .DESCRIPTION
-  Claude Code speaks the Anthropic Messages API; the qBraid gateway serves GPT
-  models only on its OpenAI-compat surface. This proxy translates between the
-  two on 127.0.0.1. Invoked by qbraid-code.cmd — ensure|status|stop.
+  Claude models pass through unchanged. GPT models use the gateway's
+  OpenAI-compatible surface. Invoked by qbraid-code.cmd: ensure|status|stop.
 #>
 param(
     [Parameter(Position = 0)]
@@ -13,20 +12,38 @@ param(
     [string]$Action = 'ensure'
 )
 $ErrorActionPreference = 'Stop'
+function Read-PidFile {
+    param([string]$Path)
+    $value = 0
+    try { if (Test-Path $Path) { [void][int]::TryParse((Get-Content $Path -Raw).Trim(), [ref]$value) } } catch { }
+    return $value
+}
 
 $HomeDir = if ($env:QBRAID_CODE_HOME) { $env:QBRAID_CODE_HOME } else { Join-Path $env:USERPROFILE '.qbraid-code' }
+$ProfileDir = $env:QBRAID_CODE_PROFILE_HOME
+if (-not $ProfileDir) {
+    $profile = $env:QBRAID_CODE_PROFILE
+    if (-not $profile -and (Test-Path (Join-Path $HomeDir 'active-profile'))) {
+        $profile = (Get-Content (Join-Path $HomeDir 'active-profile') -Raw).Trim()
+    }
+    if (-not $profile) { $profile = 'default' }
+    $ProfileDir = Join-Path (Join-Path $HomeDir 'profiles') $profile
+    if (-not (Test-Path (Join-Path $ProfileDir 'env')) -and $profile -eq 'default') { $ProfileDir = $HomeDir }
+}
 $Port = 8320
 $Bin = ''
-$envPath = Join-Path $HomeDir 'env'
+$envPath = Join-Path $ProfileDir 'env'
 if (Test-Path $envPath) {
     foreach ($line in Get-Content $envPath) {
         if ($line -match '^\s*QBRAID_CODE_PROXY_PORT\s*=\s*(.*)$') { $Port = [int]$Matches[1] }
         if ($line -match '^\s*QBRAID_CODE_PROXY_BIN\s*=\s*(.*)$')  { $Bin  = $Matches[1] }
     }
 }
-$KeyFile = Join-Path $HomeDir 'proxy.key'
-$Config  = Join-Path $HomeDir 'proxy-config.yaml'
-$LogFile = Join-Path $HomeDir 'proxy.log'
+$Config = if ($env:QBRAID_CODE_RUNTIME_CONFIG) { $env:QBRAID_CODE_RUNTIME_CONFIG } else { Join-Path $ProfileDir 'proxy-config.yaml' }
+$RuntimeDir = Split-Path $Config -Parent
+$KeyFile = if ($env:QBRAID_CODE_RUNTIME_KEY_FILE) { $env:QBRAID_CODE_RUNTIME_KEY_FILE } else { Join-Path $ProfileDir 'proxy.key' }
+$LogFile = Join-Path $RuntimeDir 'proxy.log'
+if ($env:QBRAID_CODE_RUNTIME_PORT) { $Port = [int]$env:QBRAID_CODE_RUNTIME_PORT }
 $BaseUrl = "http://127.0.0.1:$Port"
 
 function Test-Proxy {
@@ -45,10 +62,19 @@ switch ($Action) {
         exit 0
     }
     'stop' {
-        $procs = Get-CimInstance Win32_Process -Filter "Name like '%cliproxyapi%'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like "*$Config*" }
-        if ($procs) {
-            $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $pidFile = Join-Path $RuntimeDir 'proxy.pid'
+        $proxyPid = Read-PidFile $pidFile
+        $owned = $null
+        if ($proxyPid) {
+            $owned = Get-CimInstance Win32_Process -Filter "ProcessId=$proxyPid" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Config) }
+        }
+        if ($owned) {
+            Stop-Process -Id $proxyPid -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $proxyPid -Timeout 5 -ErrorAction SilentlyContinue
+            if (-not (Get-Process -Id $proxyPid -ErrorAction SilentlyContinue)) {
+                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            }
             Write-Output 'proxy stopped'
         } else {
             Write-Output 'proxy was not running'
@@ -65,12 +91,16 @@ switch ($Action) {
             Write-Error 'proxy config missing - re-run the installer.'
             exit 1
         }
-        Start-Process -FilePath $Bin -ArgumentList '-config', $Config `
-            -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError "$LogFile.err"
+        $process = Start-Process -FilePath $Bin -ArgumentList "-config `"$Config`"" `
+            -WindowStyle Hidden -RedirectStandardOutput $LogFile -RedirectStandardError "$LogFile.err" -PassThru
+        [IO.File]::WriteAllText((Join-Path $RuntimeDir 'proxy.pid'), [string]$process.Id, (New-Object Text.UTF8Encoding $false))
         for ($i = 0; $i -lt 40; $i++) {
             if (Test-Proxy) { exit 0 }
             Start-Sleep -Milliseconds 300
         }
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $process.Id -Timeout 5 -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $RuntimeDir 'proxy.pid') -Force -ErrorAction SilentlyContinue
         Write-Error "proxy failed to start - see $LogFile"
         exit 1
     }
