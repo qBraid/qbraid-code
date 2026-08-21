@@ -104,6 +104,31 @@ echo args=%*
     $status = ('{"model":{"display_name":"Haiku"},"workspace":{"current_dir":"C:\\tmp"}}' | & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'statusline.ps1')) -join "`n"
     if ($status -notmatch 'qBraid' -or $status -notmatch 'Beta Lab' -or $status -notmatch '19') { throw "status binding failed: $status" }
 
+    function global:claude {
+        $joined = $args -join ' '
+        $global:LASTEXITCODE = 0
+        if ($joined -eq '--version') { '2.1.238 (Claude Code)' }
+        elseif ($joined -eq 'mcp --help') { '  add [options]'; '  get <name>'; '  login <name>' }
+        elseif ($joined -eq 'mcp add --help') { '  --transport <transport> http'; '  --scope <scope> user' }
+    }
+    function global:Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Uri -like '*/billing/credits/balance') {
+            if ($Headers['X-API-Key'] -ne 'token-beta') { throw 'doctor did not resolve the selected Credential Locker secret' }
+            return [pscustomobject]@{ data = [pscustomobject]@{ qbraidCredits = 19 } }
+        }
+        return [pscustomobject]@{}
+    }
+    $env:QBRAID_CODE_PROFILE_HOME = $beta
+    $doctor = (& (Join-Path $root 'doctor.ps1') 6>&1) -join "`n"
+    if ($doctor -notmatch 'claude:\s+2\.1\.238' -or
+        $doctor -notmatch 'model:\s+claude-haiku-4-5' -or
+        $doctor -notmatch 'proxy:\s+installed \(starts once per launch\)') {
+        throw "selected-profile doctor integration failed: $doctor"
+    }
+    Remove-Item Function:\claude
+    Remove-Item Function:\Invoke-RestMethod
+
     $sources = Get-Content (Join-Path $root 'qbraid-code.cmd'), (Join-Path $root 'install.ps1') -Raw
     if ($sources -match 'MAX_THINKING_TOKENS=0') { throw 'thinking workaround remains' }
     Write-Host 'windows profile tests passed'

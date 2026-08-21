@@ -7,6 +7,9 @@
 # shell that never set the variable.
 set -euo pipefail
 
+CLAUDE_MIN_VERSION="2.1.186"
+CLAUDE_TESTED_MAX="2.1.238"
+
 HOME_DIR="${QBRAID_CODE_HOME:-}"
 if [ -z "$HOME_DIR" ] && [ -f "${BASH_SOURCE[0]}.home" ]; then
   IFS= read -r HOME_DIR < "${BASH_SOURCE[0]}.home" || true
@@ -313,6 +316,51 @@ model_context() {
   awk -F '\t' -v wanted="$id" '$1 == wanted { print $2; exit }' "$PROFILE_HOME/models.tsv"
 }
 
+parse_claude_version() { # parse_claude_version <claude --version output>
+  (
+    set +o pipefail
+    printf '%s' "$1" | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1
+  ) || true
+}
+
+compare_versions() { # compare_versions <left> <right> -> -1, 0, or 1
+  awk -v left="$1" -v right="$2" 'BEGIN {
+    split(left, l, "."); split(right, r, ".")
+    for (i = 1; i <= 3; i++) {
+      if ((l[i] + 0) < (r[i] + 0)) { print -1; exit }
+      if ((l[i] + 0) > (r[i] + 0)) { print 1; exit }
+    }
+    print 0
+  }'
+}
+
+claude_version_status() { # claude_version_status <version>
+  local version="$1" compared
+  [ -n "$version" ] || { printf 'unknown'; return; }
+  compared=$(compare_versions "$version" "$CLAUDE_MIN_VERSION")
+  [ "$compared" -ge 0 ] || { printf 'below-minimum'; return; }
+  compared=$(compare_versions "$version" "$CLAUDE_TESTED_MAX")
+  [ "$compared" -le 0 ] && printf 'tested' || printf 'newer-than-tested'
+}
+
+claude_supports_mcp_command() { # claude_supports_mcp_command <command>
+  local help
+  help=$(claude mcp --help 2>/dev/null || true)
+  printf '%s\n' "$help" | grep -Eq "^[[:space:]]+$1([[:space:]]|$)"
+}
+
+claude_supports_mcp_http() {
+  local help
+  help=$(claude mcp add --help 2>/dev/null || true)
+  printf '%s\n' "$help" | grep -Eq -- '--transport.*http'
+}
+
+claude_supports_mcp_user_scope() {
+  local help
+  help=$(claude mcp add --help 2>/dev/null || true)
+  printf '%s\n' "$help" | grep -Eq -- '--scope.*user'
+}
+
 missing_keys() {
   local missing=""
   [ -n "$BASE_URL" ] || missing="$missing QBRAID_CODE_BASE_URL"
@@ -328,9 +376,29 @@ case "${1:-}" in
     echo "qbraid-code: local proxies stopped"
     exit 0 ;;
   --doctor)
-    command -v claude >/dev/null 2>&1 \
-      && echo "claude:   $(claude --version 2>/dev/null || echo present)" \
-      || echo "claude:   NOT INSTALLED"
+    CLAUDE_VERSION=""; CLAUDE_STATUS=missing
+    MCP_ADD=no; MCP_GET=no; MCP_LOGIN=no; MCP_HTTP=no; MCP_USER_SCOPE=no
+    if command -v claude >/dev/null 2>&1; then
+      CLAUDE_OUTPUT=$(claude --version 2>/dev/null || true)
+      CLAUDE_VERSION=$(parse_claude_version "$CLAUDE_OUTPUT")
+      CLAUDE_STATUS=$(claude_version_status "$CLAUDE_VERSION")
+      claude_supports_mcp_command add && MCP_ADD=yes
+      claude_supports_mcp_command get && MCP_GET=yes
+      claude_supports_mcp_command login && MCP_LOGIN=yes
+      claude_supports_mcp_http && MCP_HTTP=yes
+      claude_supports_mcp_user_scope && MCP_USER_SCOPE=yes
+      echo "claude:   ${CLAUDE_OUTPUT:-present}"
+    else
+      echo "claude:   NOT INSTALLED"
+    fi
+    case "$CLAUDE_STATUS" in
+      tested) echo "claude-min: PASS (requires $CLAUDE_MIN_VERSION+)"; echo "claude-tested: within tested range through $CLAUDE_TESTED_MAX" ;;
+      newer-than-tested) echo "claude-min: PASS (requires $CLAUDE_MIN_VERSION+)"; echo "claude-tested: NEWER than tested $CLAUDE_TESTED_MAX (not blocked)" ;;
+      below-minimum) echo "claude-min: FAIL (requires $CLAUDE_MIN_VERSION+, found $CLAUDE_VERSION)"; echo "claude-tested: unsupported" ;;
+      *) echo "claude-min: UNKNOWN (requires $CLAUDE_MIN_VERSION+)"; echo "claude-tested: unknown" ;;
+    esac
+    echo "claude-policy: ${QBRAID_CODE_CLAUDE_POLICY:-prompt}"
+    echo "capabilities: mcp-add=$MCP_ADD mcp-get=$MCP_GET mcp-login=$MCP_LOGIN mcp-http=$MCP_HTTP mcp-user-scope=$MCP_USER_SCOPE"
 
     MISSING=$(missing_keys)
     if [ -n "$MISSING" ]; then
@@ -382,10 +450,20 @@ case "${1:-}" in
       echo "gateway:  UNREACHABLE"
     fi
 
-    if claude mcp get qbraid >/dev/null 2>&1; then
-      echo "mcp:      registered (run 'claude mcp login qbraid' if tools are missing)"
+    if [ "$MCP_GET" != yes ]; then
+      echo "mcp:      UNAVAILABLE — upgrade Claude Code or configure it through /mcp"
+    elif claude mcp get qbraid >/dev/null 2>&1; then
+      if [ "$MCP_LOGIN" = yes ]; then
+        echo "mcp:      registered (run 'claude mcp login qbraid' if tools are missing)"
+      else
+        echo "mcp:      registered (run /mcp inside Claude Code to authenticate)"
+      fi
     else
-      echo "mcp:      NOT REGISTERED"
+      if [ "$MCP_LOGIN" = yes ]; then
+        echo "mcp:      NOT REGISTERED — re-run the installer"
+      else
+        echo "mcp:      NOT REGISTERED — configure and authenticate through /mcp"
+      fi
     fi
 
     echo "model:    ${MODEL:-not set}"

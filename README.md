@@ -49,6 +49,24 @@ Older installs that use one account migrate to `profiles/default` once. Migratio
 not overwrite an existing profile. A running legacy proxy keeps its private
 config until it exits. The next launch removes the retired secret files.
 
+### Keep Claude Code compatible
+
+`qbraid-code` supports Claude Code 2.1.186 or newer. It is tested through
+2.1.238. The installer checks both the version and required HTTP MCP commands.
+
+Set `QBRAID_CODE_CLAUDE_POLICY` before installation to control an incompatible
+Claude Code installation.
+
+| Value | Installer behavior |
+|---|---|
+| `prompt` | Ask before installing or upgrading. Fail without a terminal. |
+| `upgrade` | Install Anthropic's stable channel without prompting. |
+| `fail` | Stop without changing Claude Code. |
+| `continue` | Keep the installed version and skip unavailable features. |
+
+The installer never downgrades a newer or unrecognized version. If your version
+cannot run `claude mcp login`, authenticate through Claude Code's `/mcp` menu.
+
 ## Start a session
 
 Start an interactive session with the active organization and default model.

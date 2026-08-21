@@ -61,6 +61,10 @@ jobs:
         shell: powershell
         run: tests/windows-profiles.ps1
 
+      - name: Claude compatibility policy tests
+        shell: powershell
+        run: tests/claude-compat.Tests.ps1
+
       - name: batch launcher is CRLF and BOM-free
         shell: pwsh
         run: |
@@ -80,3 +84,25 @@ jobs:
           rem `echo` does not reset ERRORLEVEL in cmd, so the expected 1 would
           rem otherwise leak out and fail the step.
           exit /b 0
+
+  claude-compat:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: '2.1.186'
+            experimental: false
+          - release: stable
+            experimental: false
+          - release: latest
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code ${{ matrix.release }}
+        run: curl -fsSL https://claude.ai/install.sh | bash -s "${{ matrix.release }}"
+      - name: Check installed CLI capabilities
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          tests/claude-installed-compat.sh

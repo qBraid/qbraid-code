@@ -14,7 +14,21 @@ cat > "$HOME_ROOT/.claude/settings.json" <<'EOF'
 EOF
 cat > "$FAKE_BIN/claude" <<'EOF'
 #!/usr/bin/env bash
-case "${1:-}" in --version) echo 2.1.238 ;; mcp) exit 0 ;; *) exit 0 ;; esac
+case "${1:-}" in
+  --version) echo 2.1.238 ;;
+  mcp)
+    if [ "${2:-}" = --help ]; then
+      printf '  add
+  get
+  login
+'
+    elif [ "${2:-}" = add ] && [ "${3:-}" = --help ]; then
+      printf '%s
+' '--transport <transport> [http]' '--scope <scope> [user]'
+    fi
+    ;;
+esac
+exit 0
 EOF
 cat > "$FAKE_BIN/cliproxyapi" <<'EOF'
 #!/usr/bin/env bash
