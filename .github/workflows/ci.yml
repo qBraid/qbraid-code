@@ -58,7 +58,7 @@ jobs:
           }
 
       - name: Windows profile tests
-        shell: pwsh
+        shell: powershell
         run: tests/windows-profiles.ps1
 
       - name: batch launcher is CRLF and BOM-free

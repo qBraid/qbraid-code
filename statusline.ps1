@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  qbraid-code statusline — folder, branch, model, context, qBraid credits.
+  qbraid-code statusline - folder, branch, model, context, qBraid credits.
 
 .DESCRIPTION
   Claude Code runs this on every render and feeds it the session JSON on
@@ -114,7 +114,7 @@ $labelSource = if (Test-Path $sourcePath) { (Get-Content $sourcePath -Raw).Trim(
 if ($labelSource -eq 'local') {
     $orgPath = Join-Path $ProfileDir 'organization-id'
     $orgId = if (Test-Path $orgPath) { (Get-Content $orgPath -Raw).Trim() } else { '' }
-    if ($orgId -match '^[A-Za-z0-9._-]+$') { $shortOrg = $orgId.Substring(0, [Math]::Min(8, $orgId.Length)); $label = "$label (local · org $shortOrg…)" } else { $label = "$label (local)" }
+    if ($orgId -match '^[A-Za-z0-9._-]+$') { $shortOrg = $orgId.Substring(0, [Math]::Min(8, $orgId.Length)); $label = "$label (local $([char]0x00B7) org $shortOrg$([char]0x2026))" } else { $label = "$label (local)" }
 }
 $accountSeg = "${violet}qBraid$rst $label"
 if ($credits) {

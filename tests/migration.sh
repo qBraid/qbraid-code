@@ -98,7 +98,7 @@ if [ ! -f "$SS_ROOT/profiles/default/env" ] && [ ! -f "$TMP/secret-service.value
   pass=$((pass + 1)); printf '  ok   first generation retires migrated flat-profile secrets\n'
 else fail=$((fail + 1)); printf '  FAIL migrated flat-profile secret cleanup\n'; fi
 
-mode=$(stat -f '%Lp' "$ROOT/profiles/default" 2>/dev/null || stat -c '%a' "$ROOT/profiles/default")
+mode=$(stat -c '%a' "$ROOT/profiles/default" 2>/dev/null || stat -f '%Lp' "$ROOT/profiles/default" 2>/dev/null)
 if [ "$mode" = 700 ]; then pass=$((pass + 1)); printf '  ok   migrated profile is private\n'; else fail=$((fail + 1)); echo "  FAIL migrated mode=$mode"; fi
 
 # Configured ports are unique and existing profiles retain their allocation.

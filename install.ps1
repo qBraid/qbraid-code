@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  qbraid-code installer for Windows — Claude Code, powered by the qBraid AI gateway.
+  qbraid-code installer for Windows - Claude Code, powered by the qBraid AI gateway.
 
 .DESCRIPTION
   Claude models use the qBraid Anthropic Messages surface directly. GPT models
@@ -248,7 +248,7 @@ Say 'Claude Code'
 if (Get-Command claude -ErrorAction SilentlyContinue) {
     Ok 'already installed'
 } else {
-    Warn 'not installed — installing'
+    Warn 'not installed - installing'
     # Anthropic's official installer: a native binary, no Node.js, no admin rights.
     try {
         & ([scriptblock]::Create((Invoke-RestMethod -Uri 'https://claude.ai/install.ps1')))
@@ -351,7 +351,7 @@ if (-not $ApiKey) {
             $ApiKey = $candidate
             $KeySource = '~\.qbraid\qbraidrc'
         } else {
-            Warn 'the key in ~\.qbraid\qbraidrc is no longer valid — ignoring it'
+            Warn 'the key in ~\.qbraid\qbraidrc is no longer valid - ignoring it'
         }
     }
 }
@@ -394,7 +394,7 @@ $CreditsRaw = Get-Prop $balanceData 'qbraidCredits'
 $Credits = if ($null -eq $CreditsRaw) { 'unknown' } else { [Math]::Round([double]$CreditsRaw) }
 # /organizations/current returns the organization document itself, so `name` is
 # the organization's. /organizations/me returns *membership* details, whose
-# name is the user's — labelling the confirmation with that would be worse than
+# name is the user's - labelling the confirmation with that would be worse than
 # showing nothing. The id is printed alongside so a bad lookup cannot quietly
 # point someone at the wrong organization.
 $OrgName = $null
@@ -443,7 +443,7 @@ if (-not $Model) {
     } catch { }
 
     if ($ids.Count -eq 0) {
-        Warn 'could not list models — defaulting to claude-sonnet-4-6'
+        Warn 'could not list models - defaulting to claude-sonnet-4-6'
         $Model = 'claude-sonnet-4-6'
     } else {
         Write-Host ''

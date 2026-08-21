@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $vault = $null; $alphaCredential = $null; $betaCredential = $null
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ("qbraid profiles ü " + [guid]::NewGuid())
+$unicodeChar = [char]0x00FC
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ("qbraid profiles $unicodeChar " + [guid]::NewGuid())
 try {
     $qcHome = Join-Path $tmp 'home with space'
     $bin = Join-Path $tmp 'bin'
@@ -78,7 +79,7 @@ echo args=%*
     if ($out -match 'token=token-alpha' -or $out -notmatch 'model=claude-opus-5\[1m\]' -or $out -notmatch 'args=-p hello' -or $out -notmatch '--setting-sources user') { throw "active binding failed: $out" }
     if ((Get-Content (Join-Path $qcHome 'env') -Raw) -match 'legacy-root-token' -or (Test-Path (Join-Path $qcHome 'proxy-config.yaml'))) { throw 'legacy plaintext artifacts were not scavenged' }
     $runtimeYaml = Get-Content $env:CAPTURE_PROXY_CONFIG -Raw
-    if ($runtimeYaml -notmatch 'auth-dir: "[^"]*qbraid profiles ü [^"]*/runtime\.') { throw "runtime YAML path encoding failed: $runtimeYaml" }
+    if (-not $runtimeYaml.Contains($unicodeChar) -or $runtimeYaml -notmatch 'auth-dir: "[^"]*qbraid profiles [^"]*/runtime\.') { throw "runtime YAML path encoding failed: $runtimeYaml" }
     $out = & cmd /c (Join-Path $root 'qbraid-code.cmd') --profile beta -p hello
     if ($out -match 'token=token-beta' -or $out -notmatch 'context=200000' -or $out -match '--profile') { throw "explicit binding failed: $out" }
     & cmd /c (Join-Path $root 'qbraid-code.cmd') --use-profile beta | Out-Null

@@ -143,7 +143,7 @@ if [ -z "$TOKEN" ]; then
     keychain) TOKEN=$(security find-generic-password -a "${USER:-$(id -un)}" -s "$SECRET_REF" -w 2>/dev/null || true) ;;
     secret-service) command -v secret-tool >/dev/null 2>&1 && TOKEN=$(secret-tool lookup service qbraid-code ref "$SECRET_REF" 2>/dev/null || true) ;;
     file)
-      SECRET_MODE=$(stat -f '%Lp' "$SECRET_REF" 2>/dev/null || stat -c '%a' "$SECRET_REF" 2>/dev/null || true)
+      SECRET_MODE=$(stat -c '%a' "$SECRET_REF" 2>/dev/null || stat -f '%Lp' "$SECRET_REF" 2>/dev/null || true)
       [ "$SECRET_MODE" = 600 ] && TOKEN=$(cat "$SECRET_REF" 2>/dev/null || true) ;;
   esac
 fi
@@ -206,7 +206,7 @@ prepare_proxy_runtime() {
   chmod 700 "$HOME_DIR/ports" 2>/dev/null || true
   candidate=$PROXY_PORT
   while [ "$candidate" -le 8999 ]; do
-    if (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then candidate=$((candidate + 1)); continue; fi
+    if { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then candidate=$((candidate + 1)); continue; fi
     if mkdir "$HOME_DIR/ports/$candidate" 2>/dev/null; then
       printf '%s\n' "$$" > "$HOME_DIR/ports/$candidate/pid"
       PORT_LOCK="$HOME_DIR/ports/$candidate"
