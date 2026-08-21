@@ -19,7 +19,7 @@ function Invoke-ChildPowerShell([string]$ScriptPath, [string[]]$ArgumentList = @
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @ArgumentList *> $null
+        $script:LastChildOutput = (& powershell -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @ArgumentList 2>&1 | Out-String)
         return [int]$LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousPreference
@@ -123,7 +123,7 @@ try {
     $orphanStopExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--profile', 'alpha', '--stop')
     $ownedProxyProcess.Refresh()
     if ($orphanStopExit -eq 0 -and $ownedProxyProcess.HasExited -and -not (Test-Path $ownedRuntime)) { Pass '--stop removes verified orphaned Windows proxies' }
-    else { Fail '--stop removes verified orphaned Windows proxies' }
+    else { Fail '--stop removes verified orphaned Windows proxies'; Write-Output $script:LastChildOutput }
 
     New-Item -ItemType Directory -Force -Path $ownedRuntime | Out-Null
     Write-Utf8 $ownedConfig "port: 8320`n"
@@ -133,7 +133,7 @@ try {
     $ownedProxyProcess.Refresh()
     if ($ownedProcessExit -eq 0 -and $ownedProxyProcess.HasExited -and -not (Test-Path $ownedProcessHome)) {
         Pass 'uninstall stops only an owned proxy executable with its exact config'
-    } else { Fail 'uninstall stops only an owned proxy executable with its exact config' }
+    } else { Fail 'uninstall stops only an owned proxy executable with its exact config'; Write-Output $script:LastChildOutput }
 
     $unownedProcessUser = Join-Path $tmp 'unowned-process-user'
     $unownedProcessHome = Join-Path $unownedProcessUser '.qbraid-code'
@@ -249,7 +249,7 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     $offlineUninstallExit = Invoke-ChildPowerShell $offlineUninstallWrapper
     if ($offlineUninstallExit -eq 0 -and -not (Test-Path $customHome)) {
         Pass 'custom sidecar uninstall is local and needs no environment override'
-    } else { Fail 'custom sidecar uninstall is local and needs no environment override' }
+    } else { Fail 'custom sidecar uninstall is local and needs no environment override'; Write-Output $script:LastChildOutput }
 
     $invalidProfile = Join-Path $tmp 'invalid-json-user'
     $invalidHome = Join-Path $invalidProfile '.qbraid-code'
@@ -296,10 +296,15 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     $env:QBRAID_CODE_HOME = $homeDir
     $cmdPath = Join-Path $binDir 'qbraid-code.cmd'
     Push-Location $binDir
+    $previousPreference = $ErrorActionPreference
     try {
+        $ErrorActionPreference = 'Continue'
         $output = & cmd.exe /d /c qbraid-code.cmd --uninstall --yes 2>&1 | Out-String
         $uninstallExit = $LASTEXITCODE
-    } finally { Pop-Location }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        Pop-Location
+    }
     if ($uninstallExit -eq 0 -and -not (Test-Path $homeDir) -and -not (Test-Path $cmdPath) -and
         -not (Test-Path (Join-Path $binDir 'qbraid-launch.ps1')) -and -not (Test-Path (Join-Path $binDir 'qbraid-code.home'))) {
         Pass 'uninstall removes the Windows installation and launchers'
