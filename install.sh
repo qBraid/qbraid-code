@@ -694,7 +694,9 @@ PROFILE_STAGE="$PROFILE_ROOT/generations/.stage.$$"
 rm -rf "$PROFILE_STAGE"; mkdir "$PROFILE_STAGE"; chmod 700 "$PROFILE_STAGE"
 store_profile_secret
 PROFILE_DIR="$PROFILE_STAGE"
-PROFILE_LABEL=$(sanitize_profile_label "${QBRAID_CODE_PROFILE_LABEL:-${ORG_NAME:-$PROFILE}}" "$PROFILE")
+if [ -n "${QBRAID_CODE_PROFILE_LABEL:-}" ]; then PROFILE_LABEL=$(sanitize_profile_label "$QBRAID_CODE_PROFILE_LABEL" "$PROFILE"); PROFILE_LABEL_SOURCE=local
+elif [ -n "$ORG_NAME" ]; then PROFILE_LABEL=$(sanitize_profile_label "$ORG_NAME" "$PROFILE"); PROFILE_LABEL_SOURCE=verified
+else PROFILE_LABEL="$PROFILE"; PROFILE_LABEL_SOURCE=local; fi
 OLD_UMASK=$(umask)
 umask 077
 rm -f "$PROFILE_DIR/proxy-config.yaml" "$PROFILE_DIR/proxy-template.yaml" "$PROFILE_DIR/proxy.key"
@@ -707,7 +709,7 @@ QBRAID_CODE_SECRET_BACKEND=$SECRET_BACKEND
 QBRAID_CODE_SECRET_REF=$SECRET_REF
 EOF
 printf '%s\n' "$PROFILE_LABEL" > "$PROFILE_DIR/label"
-if [ -n "$ORG_NAME" ]; then printf 'verified\n' > "$PROFILE_DIR/label-source"; else printf 'local\n' > "$PROFILE_DIR/label-source"; fi
+printf '%s\n' "$PROFILE_LABEL_SOURCE" > "$PROFILE_DIR/label-source"
 [ -z "$ORG_ID" ] || printf '%s\n' "$ORG_ID" > "$PROFILE_DIR/organization-id"
 write_models_tsv "$PROFILE_DIR/models.tsv" "${API_BODY:-}"
 chmod 600 "$PROFILE_DIR/env" "$PROFILE_DIR/label" "$PROFILE_DIR/models.tsv" "$PROFILE_DIR/organization-id" 2>/dev/null || true

@@ -34,7 +34,7 @@ while [ "$#" -gt 0 ]; do
 done
 case "$url" in
   *billing/credits/balance*) org=org-alpha; case "$cfg" in *key-beta*) org=org-beta ;; esac; body="{\"data\":{\"organizationId\":\"$org\",\"qbraidCredits\":100}}"; code=200 ;;
-  *organizations/current*) body='{}'; code=403 ;; *'/quota') body='{"plan":"pro"}'; code=200 ;;
+  *organizations/current*) body='{"data":{"name":"Verified Lab"}}'; code=200 ;; *'/quota') body='{"plan":"pro"}'; code=200 ;;
   *'/ai/models') body='{"data":[{"id":"claude-haiku-4-5","context_window":200000},{"id":"gpt-5.4","context_window":400000}]}'; code=200 ;;
   *'/v1/messages') body='{"content":[{"text":"OK"}]}'; code=200 ;; *api.github.com*) exit 22 ;;
   *) body='{}'; code=404 ;;
@@ -81,6 +81,7 @@ BETA_DIR=$(profile_dir beta)
 if [ "$(cat "$QC_HOME/active-profile")" = beta ] &&
    [ ! -e "$QC_HOME/global-profile" ] &&
    [ "$(cat "$BETA_DIR/organization-id")" = org-beta ] &&
+   [ "$(cat "$BETA_DIR/label")" = 'Beta Team' ] && [ "$(cat "$BETA_DIR/label-source")" = local ] &&
    grep -q '^QBRAID_CODE_SECRET_BACKEND=\(keychain\|file\)$' "$BETA_DIR/env" &&
    ! grep -q 'key-beta' "$BETA_DIR/env"; then
   ok 'install activates metadata without persisting its key'
@@ -129,6 +130,9 @@ if QBRAID_API_KEY=key-beta bash install.sh --profile beta > "$TMP/live.out" 2> "
   bad 'installer updated a profile with a live session'
 elif grep -q 'running session' "$TMP/live.err"; then ok 'live profile update fails closed'; else bad 'live update diagnosis'; fi
 rm -f "$QC_HOME/profiles/beta/session-users/$$"
+QBRAID_CODE_PROFILE_LABEL='' QBRAID_API_KEY=key-beta bash install.sh --profile verified > "$TMP/verified.out"
+VERIFIED_DIR=$(profile_dir verified)
+if [ "$(cat "$VERIFIED_DIR/label")" = 'Verified Lab' ] && [ "$(cat "$VERIFIED_DIR/label-source")" = verified ]; then ok 'authenticated organization names retain verified provenance'; else bad 'verified label provenance'; fi
 
 if bash install.sh --profle beta > /dev/null 2> "$TMP/unknown.err"; then bad 'unknown installer option was ignored';
 elif grep -q 'unknown option' "$TMP/unknown.err"; then ok 'unknown installer option is rejected'; else bad 'unknown option diagnosis'; fi

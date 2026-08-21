@@ -485,10 +485,11 @@ $envPath = Join-Path $ProfileDir 'env'
 Remove-Item (Join-Path $ProfileDir 'proxy-config.yaml'), (Join-Path $ProfileDir 'proxy-template.yaml'), (Join-Path $ProfileDir 'proxy.key'), (Join-Path $ProfileDir 'proxy-auth') -Recurse -Force -ErrorAction SilentlyContinue
 Write-RawText $envPath (($envLines -join "`n") + "`n")
 $ProfileLabel = if ($env:QBRAID_CODE_PROFILE_LABEL) { $env:QBRAID_CODE_PROFILE_LABEL } elseif ($OrgName) { $OrgName } else { $Profile }
+$ProfileLabelSource = if ($env:QBRAID_CODE_PROFILE_LABEL) { 'local' } elseif ($OrgName) { 'verified' } else { 'local' }
 $ProfileLabel = ($ProfileLabel -replace '[\x00-\x1F\x7F]', '')
-if (-not $ProfileLabel -or $ProfileLabel.Length -gt 40) { $ProfileLabel = $Profile }
+if (-not $ProfileLabel -or $ProfileLabel.Length -gt 40) { $ProfileLabel = $Profile; $ProfileLabelSource = 'local' }
 Write-RawText (Join-Path $ProfileDir 'label') "$ProfileLabel`n"
-Write-RawText (Join-Path $ProfileDir 'label-source') "$(if ($OrgName) { 'verified' } else { 'local' })`n"
+Write-RawText (Join-Path $ProfileDir 'label-source') "$ProfileLabelSource`n"
 if ($OrgId) { Write-RawText $orgIdPath "$OrgId`n" }
 $modelFacts = @(
     "claude-haiku-4-5`t200000",
