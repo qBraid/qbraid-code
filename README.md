@@ -59,8 +59,8 @@ OpenAI-compatible surface. Because it is one endpoint, `/model <name>` works
 for **any** of the models mid-session, e.g. `/model gpt-5.6-sol`.
 
 If the proxy is missing, Claude models automatically fall back to the gateway
-directly — they can never break because of it. `qbraid-code --stop` shuts the
-proxy down.
+directly — they can never break because of it. It shuts down by itself when
+you quit the session that started it; `qbraid-code --stop` stops it by hand.
 
 One caveat: GPT models accept at most 128 tools, so with many MCP servers add
 `--strict-mcp-config`.
