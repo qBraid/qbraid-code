@@ -25,6 +25,7 @@ fi
 [ -n "$PROFILE_HOME" ] || PROFILE_HOME="$HOME_DIR"
 CACHE="$PROFILE_HOME/credits.cache"
 UPDATED="$PROFILE_HOME/credits.updated"
+KEY_STATUS=$(cat "$PROFILE_HOME/key-status" 2>/dev/null || true)
 PROFILE_LABEL=$(cat "$PROFILE_HOME/label" 2>/dev/null || printf '%s' "${QBRAID_CODE_PROFILE:-default}")
 PROFILE_LABEL=$(printf '%s' "$PROFILE_LABEL" | tr -d '\001-\037\177')
 LABEL_BYTES=$(LC_ALL=C printf '%s' "$PROFILE_LABEL" | wc -c | tr -d ' ')
@@ -91,7 +92,9 @@ if [ "$label_source" = local ]; then
   case "$org_tag" in ''|*[!A-Za-z0-9._-]*) PROFILE_LABEL="$PROFILE_LABEL (local)" ;; *) PROFILE_LABEL="$PROFILE_LABEL (local · org $(printf '%s' "$org_tag" | cut -c1-8)…)" ;; esac
 fi
 account_seg="${violet}qBraid${rst} ${PROFILE_LABEL}"
-if [ -n "$credits" ]; then
+if [ "$KEY_STATUS" = expired ]; then
+  account_seg="${account_seg}${dim} · ${rst}${red}key expired${rst}"
+elif [ -n "$credits" ]; then
   pretty=$(awk -v c="$credits" 'BEGIN { printf "%.0f", c }' 2>/dev/null)
   [ -n "$pretty" ] || pretty="$credits"
   colour="$grn"

@@ -65,6 +65,14 @@ jobs:
         shell: powershell
         run: tests/claude-compat.Tests.ps1
 
+      - name: Windows lifecycle tests
+        shell: powershell
+        run: tests/windows-lifecycle.ps1
+
+      - name: Windows native installer lifecycle tests
+        shell: powershell
+        run: tests/windows-installer-lifecycle.ps1
+
       - name: batch launcher is CRLF and BOM-free
         shell: pwsh
         run: |
@@ -74,16 +82,13 @@ jobs:
           if ($text -notmatch "`r`n") { throw 'qbraid-code.cmd must use CRLF line endings' }
           'CRLF ok, no BOM'
 
-      - name: launcher reports a missing install instead of crashing
+      - name: launcher help works without an installation
         shell: cmd
         run: |
           set QBRAID_CODE_HOME=%TEMP%\qc-does-not-exist
           call qbraid-code.cmd --help
-          if not errorlevel 1 exit /b 1
-          echo missing-install path reports an error
-          rem `echo` does not reset ERRORLEVEL in cmd, so the expected 1 would
-          rem otherwise leak out and fail the step.
-          exit /b 0
+          if errorlevel 1 exit /b 1
+          if exist "%QBRAID_CODE_HOME%" exit /b 1
 
   claude-compat:
     strategy:

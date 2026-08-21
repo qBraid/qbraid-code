@@ -83,6 +83,14 @@ qbraid-code -p "explain this error"
 
 Run `qbraid-code --doctor` to check the active profile.
 
+List the qbraid-code commands without contacting qBraid or reading a profile.
+
+```bash
+qbraid-code --help
+```
+
+Run `claude --help` for arguments that qbraid-code forwards to Claude Code.
+
 ## Switch organizations
 
 List the installed organization profiles. The active profile has an asterisk.
@@ -112,9 +120,19 @@ qbraid-code --profile research --doctor
 Put `--profile NAME` first. The launcher removes both arguments before it starts
 Claude Code.
 
-To update a profile, close its running sessions and run the installer again.
-The installer stages a complete metadata generation, then switches `current`.
-If the update fails, the previous generation and key remain active.
+To replace an expired or revoked key, close sessions that use the profile.
+Then run this command:
+
+```bash
+qbraid-code --profile research --update-key
+```
+
+The command downloads the official installer and prompts for the replacement
+key. The installer verifies that the key belongs to the profile's organization.
+It stages a complete metadata generation, then switches `current`. If the
+update fails, the previous generation and key remain active.
+
+Run the installer again when you need to update other profile settings.
 
 ## Protect profile credentials
 
@@ -160,7 +178,8 @@ qBraid Research Lab (local · org a1b2c3d4…) · 4281 credits
 ```
 
 Credit snapshots show `stale` after five minutes without a successful launch
-refresh.
+refresh. A confirmed `401` or `403` response shows `key expired` until a key
+check succeeds or you rotate the key.
 
 ## Choose a model
 
@@ -236,6 +255,7 @@ claude mcp login qbraid
 
 | Path | Purpose |
 |---|---|
+| `~/.qbraid-code/.qbraid-code-install` | Ownership marker for safe custom-root removal |
 | `~/.qbraid-code/active-profile` | Future-session profile pointer |
 | `~/.qbraid-code/profiles/<name>/current` | Atomic metadata-generation pointer |
 | `~/.qbraid-code/profiles/<name>/generations/*/env` | URLs, model, secret reference, and proxy binary |
@@ -244,6 +264,7 @@ claude mcp login qbraid
 | `~/.qbraid-code/secrets/*` | Linux-only private key fallback |
 | `~/.qbraid-code/runtime.*` | Short-lived proxy state |
 | `~/.qbraid-code/session.*` | Short-lived non-secret status snapshot |
+| `~/.qbraid-code/profiles/<name>/generations/*/key-status` | Confirmed local key-rejection marker |
 | `~/.qbraid-code/statusline.sh` | Unix statusline adapter |
 | `~/.local/bin/qbraid-code` | Unix launcher |
 
@@ -256,8 +277,9 @@ Windows stores profile and runtime files under
 Start with `qbraid-code --doctor`.
 
 **Rejected key.** Create a key at
-[account.qbraid.com/account/api-keys](https://account.qbraid.com/account/api-keys),
-then update the affected profile.
+[account.qbraid.com/account/api-keys](https://account.qbraid.com/account/api-keys).
+Then close sessions that use the profile and run
+`qbraid-code --profile NAME --update-key`.
 
 **Wrong organization name.** Reinstall that profile with
 `QBRAID_CODE_PROFILE_LABEL` set to a readable local name. API-key
@@ -272,26 +294,20 @@ without a real parser.
 
 ## Uninstall
 
-On macOS or Linux, stop the proxies and remove the installed files.
+Close every qbraid-code session. Then remove qbraid-code from this device.
 
 ```bash
-qbraid-code --stop
-rm -rf ~/.qbraid-code ~/.local/bin/qbraid-code ~/.local/bin/qbraid-code.home
-claude mcp remove qbraid
+qbraid-code --uninstall
 ```
 
-On Windows, run these commands in PowerShell.
+Type `uninstall` when prompted. For unattended local cleanup, use
+`qbraid-code --uninstall --yes`.
 
-```powershell
-qbraid-code --stop
-Remove-Item -Recurse -Force "$env:USERPROFILE\.qbraid-code"
-Remove-Item -Force "$env:USERPROFILE\.local\bin\qbraid-code.cmd"
-Remove-Item -Force "$env:USERPROFILE\.local\bin\qbraid-launch.ps1"
-Remove-Item -Force "$env:USERPROFILE\.local\bin\qbraid-code.home"
-claude mcp remove qbraid
-```
+The command stops owned local proxies and removes every qbraid-code profile,
+stored local key, runtime file, proxy binary, statusline entry, qBraid MCP
+entry, and installed launcher. It preserves unrelated Claude settings and MCP
+servers. It tolerates files or credentials that are already missing.
 
-Remove the qBraid `statusLine` from the Claude user settings file. Delete
-`qbraid-code` entries from Keychain or Windows Credential Manager. On Linux,
-delete the matching Secret Service entries. Removing `~/.qbraid-code` also
-deletes the headless Linux file fallback.
+Uninstall does not contact qBraid, Anthropic, or an OAuth service. It does not
+revoke API keys in your qBraid account. Revoke those keys separately at
+[account.qbraid.com/account/api-keys](https://account.qbraid.com/account/api-keys).

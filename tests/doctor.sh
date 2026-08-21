@@ -84,8 +84,9 @@ while [ "$#" -gt 0 ]; do
   case "$1" in -o) out="$2"; shift 2 ;; -w) shift 2 ;; *) shift ;; esac
 done
 [ -z "$out" ] || : > "$out"
-printf 000
-exit 1
+status=${FAKE_STATUS:-000}
+printf '%s' "$status"
+[ "$status" != 000 ]
 EOF
 chmod +x "$tmp/bin/cliproxyapi" "$tmp/bin/curl"
 cat > "$tmp/home/.qbraid-code/profiles/research/generations/g1/env" <<EOF
@@ -102,6 +103,9 @@ check_contains "doctor resolves the active profile generation" "$profile_output"
 check_not_contains "doctor resolves the profile secret" "$profile_output" "profile-secret"
 check_contains "doctor reports the launch-owned proxy" "$profile_output" \
   "proxy:    installed (starts once per launch)"
+rejected=$(HOME="$tmp/home" PATH="$tmp/bin:$PATH" FAKE_STATUS=401 ./qbraid-code --profile research --doctor)
+check_contains "doctor gives the selected profile key-replacement command" "$rejected" \
+  "replace:  qbraid-code --profile research --update-key"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

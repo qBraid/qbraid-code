@@ -15,6 +15,870 @@ if [ -z "$HOME_DIR" ] && [ -f "${BASH_SOURCE[0]}.home" ]; then
   IFS= read -r HOME_DIR < "${BASH_SOURCE[0]}.home" || true
 fi
 [ -n "$HOME_DIR" ] || HOME_DIR="$HOME/.qbraid-code"
+
+print_help() {
+  cat <<'EOF'
+qbraid-code - Claude Code, powered by the qBraid AI gateway.
+
+Sessions
+  qbraid-code [claude arguments]               start a session
+  qbraid-code --profile NAME [claude arguments] use NAME for one session
+  qbraid-code --profile NAME --allow-profile-resume --resume SESSION_ID
+                                                confirm NAME before resuming
+
+Profiles
+  qbraid-code --profiles                       list installed profiles
+  qbraid-code --use-profile NAME               select future sessions
+  qbraid-code --profile NAME --update-key      replace an expired or revoked key
+
+Maintenance
+  qbraid-code [--profile NAME] --doctor        check setup and credentials
+  qbraid-code [--profile NAME] --stop          stop orphaned local proxies
+  qbraid-code --uninstall                      remove qbraid-code from this device
+  qbraid-code --uninstall --yes                uninstall without a prompt
+
+Help
+  qbraid-code --help                           show this help without network access
+  claude --help                                list arguments forwarded to Claude Code
+
+Uninstall deletes local qbraid-code credentials and files. It does not revoke
+API keys in your qBraid account.
+EOF
+}
+
+# Help is deliberately dispatched before profile migration, secret lookup, proxy
+# cleanup, or any network access. It remains useful when an installation breaks.
+for early_arg in "$@"; do
+  case "$early_arg" in --help|-h) print_help; exit 0 ;; esac
+done
+
+valid_profile_slug() {
+  local LC_ALL=C
+  case "${1:-}" in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${#1}" -le 32 ]
+}
+
+early_profile=""
+if [ "${1:-}" = --profile ]; then
+  [ "$#" -ge 2 ] || { echo 'qbraid-code: --profile needs a name' >&2; exit 1; }
+  early_profile="$2"
+  shift 2
+fi
+
+update_key() {
+  local profile="$1" launcher_dir
+  valid_profile_slug "$profile" || { echo "qbraid-code: invalid profile '$profile'" >&2; return 1; }
+  if [ ! -f "$HOME_DIR/profiles/$profile/current" ] && [ ! -f "$HOME_DIR/profiles/$profile/env" ] \
+    && { [ "$profile" != default ] || [ ! -f "$HOME_DIR/env" ]; }; then
+    echo "qbraid-code: profile '$profile' is not installed" >&2
+    echo "Install it with: curl -fsSL https://qbraid.com/code.sh | bash -s -- --profile $profile" >&2
+    return 1
+  fi
+  command -v curl >/dev/null 2>&1 || { echo 'qbraid-code: curl is required to update a key.' >&2; return 1; }
+  echo "qbraid-code: updating the key for profile '$profile'"
+  echo 'The replacement key must belong to the same qBraid organization.'
+  launcher_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || return 1
+  curl -fsSL https://qbraid.com/code.sh     | QBRAID_CODE_HOME="$HOME_DIR" QBRAID_CODE_BIN_DIR="$launcher_dir" bash -s -- --profile "$profile" --update-key
+}
+
+profile_env_files() {
+  local file
+  for file in \
+    "$HOME_DIR/env" \
+    "$HOME_DIR"/profiles/*/env \
+    "$HOME_DIR"/profiles/*/generations/*/env \
+    "$HOME_DIR"/profiles/*/generations/.stage.*/env; do
+    [ -f "$file" ] && printf '%s\n' "$file"
+  done
+  return 0
+}
+
+env_field() {
+  awk -v key="$2" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' "$1"
+}
+
+process_command() {
+  local pid="$1"
+  if [ -r "/proc/$pid/cmdline" ]; then
+    tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+  elif command -v ps >/dev/null 2>&1; then
+    ps -p "$pid" -o command= 2>/dev/null || true
+  fi
+}
+
+canonical_executable() {
+  local path="$1" target hops=0 directory
+  case "$path" in /*) ;; *) return 1 ;; esac
+  while [ -L "$path" ] && [ "$hops" -lt 40 ]; do
+    target=$(readlink "$path" 2>/dev/null) || return 1
+    case "$target" in /*) path="$target" ;; *) path="$(dirname -- "$path")/$target" ;; esac
+    hops=$((hops + 1))
+  done
+  [ "$hops" -lt 40 ] && [ -e "$path" ] || return 1
+  directory=$(CDPATH='' cd -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s' "$directory" "$(basename -- "$path")"
+}
+
+proxy_binary_is_native() {
+  local header system machine suffix
+  header=$(od -An -tx1 -N 20 "$1" 2>/dev/null | tr -d ' \n')
+  system=$(uname -s 2>/dev/null || true)
+  machine=$(uname -m 2>/dev/null || true)
+  case "$system:$machine" in
+    Linux:x86_64|Linux:amd64)
+      [ "${header:0:14}" = 7f454c46020101 ] || return 1
+      suffix=${header:32:8}; [ "$suffix" = 02003e00 ] || [ "$suffix" = 03003e00 ] ;;
+    Linux:aarch64|Linux:arm64)
+      [ "${header:0:14}" = 7f454c46020101 ] || return 1
+      suffix=${header:32:8}; [ "$suffix" = 0200b700 ] || [ "$suffix" = 0300b700 ] ;;
+    Darwin:x86_64)
+      [ "${header:0:16}" = cffaedfe07000001 ] && [ "${header:24:8}" = 02000000 ] ;;
+    Darwin:arm64)
+      [ "${header:0:16}" = cffaedfe0c000001 ] && [ "${header:24:8}" = 02000000 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+process_executable() {
+  local pid="$1"
+  if [ -L "/proc/$pid/exe" ]; then
+    readlink "/proc/$pid/exe" 2>/dev/null || true
+  elif [ -x /usr/sbin/lsof ]; then
+    (set +o pipefail; /usr/sbin/lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1) || true
+  elif command -v lsof >/dev/null 2>&1; then
+    (set +o pipefail; lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1) || true
+  fi
+}
+
+proxy_command_is_owned() {
+  local command="$1" marker="$2" executable="$3" env_file proxy_bin expected
+  command=${command% }
+  expected=$(canonical_executable "$HOME_DIR/cliproxyapi" 2>/dev/null || true)
+  if [ "$command" = "$HOME_DIR/cliproxyapi -config $marker" ] && [ -n "$expected" ] && [ "$executable" = "$expected" ]; then return 0; fi
+  while IFS= read -r env_file; do
+    proxy_bin=$(env_field "$env_file" QBRAID_CODE_PROXY_BIN)
+    expected=$(canonical_executable "$proxy_bin" 2>/dev/null || true)
+    [ -z "$proxy_bin" ] || [ "$command" != "$proxy_bin -config $marker" ] || [ -z "$expected" ] || [ "$executable" != "$expected" ] || return 0
+  done <<EOF
+$(profile_env_files)
+EOF
+  return 1
+}
+
+stop_owned_process() {
+  local pid="$1" marker="$2" command executable i=0
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 0
+  command=$(process_command "$pid")
+  executable=$(process_executable "$pid")
+  if [ -z "$command" ] || [ -z "$executable" ]; then
+    echo "qbraid-code: cannot verify ownership of running process $pid; stop it and retry." >&2
+    return 1
+  fi
+  if ! proxy_command_is_owned "$command" "$marker" "$executable"; then
+    case "${command% }" in *" -config $marker")
+      echo "qbraid-code: process $pid uses the runtime config but is not an owned proxy executable." >&2
+      return 1 ;;
+      *) return 0 ;;
+    esac
+  fi
+  kill "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 0.1
+  fi
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "qbraid-code: could not stop owned proxy process $pid." >&2
+    return 1
+  fi
+  return 0
+}
+
+cleanup_uninstall_locks() {
+  local lock owner
+  for lock in \
+    "$HOME_DIR/.install-lock" \
+    "$HOME_DIR/.coord-lock" \
+    "$HOME_DIR/.update-lock" \
+    "$HOME_DIR"/profiles/*/.coord-lock \
+    "$HOME_DIR"/profiles/*/.update-lock \
+    "$HOME_DIR/.install-lock.reclaim" \
+    "$HOME_DIR/.coord-lock.reclaim" \
+    "$HOME_DIR/.update-lock.reclaim" \
+    "$HOME_DIR"/profiles/*/.coord-lock.reclaim \
+    "$HOME_DIR"/profiles/*/.update-lock.reclaim \
+    "$HOME_DIR"/.install-lock.reclaim.* \
+    "$HOME_DIR"/.coord-lock.reclaim.* \
+    "$HOME_DIR"/.update-lock.reclaim.* \
+    "$HOME_DIR"/profiles/*/.coord-lock.reclaim.* \
+    "$HOME_DIR"/profiles/*/.update-lock.reclaim.*; do
+    [ -d "$lock" ] || continue
+    owner=$(cat "$lock/pid" 2>/dev/null || true)
+    [ "$owner" != "$$" ] || rm -rf "$lock"
+  done
+}
+
+lock_dir_is_stale() {
+  local lock_dir="$1" owner="" modified="" now=""
+  owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  case "$owner" in
+    ''|*[!0-9]*)
+      modified=$(stat -c '%Y' "$lock_dir" 2>/dev/null || stat -f '%m' "$lock_dir" 2>/dev/null || true)
+      now=$(date +%s)
+      [ -n "$modified" ] && [ $((now - modified)) -ge 30 ] ;;
+    *) ! kill -0 "$owner" 2>/dev/null ;;
+  esac
+}
+
+try_acquire_lock_dir() {
+  local lock_dir="$1" candidate="$1.reclaim.$$" legacy="$1.reclaim" guard leader=""
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+  lock_dir_is_stale "$lock_dir" || return 1
+  if [ -d "$legacy" ]; then
+    lock_dir_is_stale "$legacy" || return 1
+    rm -rf "$legacy"
+  fi
+  mkdir "$candidate" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$candidate/pid"
+  sleep 0.1
+  for guard in "$lock_dir".reclaim.*; do
+    [ -d "$guard" ] || continue
+    if [ "$guard" != "$candidate" ] && lock_dir_is_stale "$guard"; then rm -rf "$guard"; continue; fi
+    [ -f "$guard/leader" ] || continue
+    if [ -z "$leader" ] || [[ "$guard" < "$leader" ]]; then leader="$guard"; fi
+  done
+  if [ -z "$leader" ]; then
+    for guard in "$lock_dir".reclaim.*; do
+      [ -d "$guard" ] || continue
+      if [ -z "$leader" ] || [[ "$guard" < "$leader" ]]; then leader="$guard"; fi
+    done
+    if [ "$leader" = "$candidate" ]; then : > "$candidate/leader"; fi
+  fi
+  sleep 0.1
+  leader=""
+  for guard in "$lock_dir".reclaim.*; do
+    [ -d "$guard" ] && [ -f "$guard/leader" ] || continue
+    if [ -z "$leader" ] || [[ "$guard" < "$leader" ]]; then leader="$guard"; fi
+  done
+  if [ "$leader" != "$candidate" ]; then rm -rf "$candidate"; return 1; fi
+  if ! lock_dir_is_stale "$lock_dir"; then rm -rf "$candidate"; return 1; fi
+  rm -rf "$lock_dir"
+  if ! mkdir "$lock_dir" 2>/dev/null; then rm -rf "$candidate"; return 1; fi
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  rm -rf "$candidate"
+}
+
+acquire_uninstall_lock_dir() {
+  local lock="$1" owner
+  if try_acquire_lock_dir "$lock"; then return 0; fi
+  owner=$(cat "$lock/pid" 2>/dev/null || true)
+  [ -n "$owner" ] && echo "qbraid-code: process $owner is using $lock." >&2 \
+    || echo "qbraid-code: $lock is being acquired by another process." >&2
+  return 1
+}
+
+acquire_uninstall_locks() {
+  local root
+  [ -d "$HOME_DIR" ] || return 0
+  acquire_uninstall_lock_dir "$HOME_DIR/.install-lock" || return 1
+  if [ -f "$HOME_DIR/env" ]; then
+    acquire_uninstall_lock_dir "$HOME_DIR/.coord-lock" || return 1
+    acquire_uninstall_lock_dir "$HOME_DIR/.update-lock" || return 1
+  fi
+  for root in "$HOME_DIR"/profiles/*; do
+    [ -d "$root" ] || continue
+    acquire_uninstall_lock_dir "$root/.coord-lock" || return 1
+    acquire_uninstall_lock_dir "$root/.update-lock" || return 1
+  done
+}
+
+uninstall_has_live_work() {
+  local file pid
+  for file in \
+    "$HOME_DIR/.install-lock/pid" \
+    "$HOME_DIR/.update-lock/pid" \
+    "$HOME_DIR/.coord-lock/pid" \
+    "$HOME_DIR"/session-users/* \
+    "$HOME_DIR"/profiles/*/.update-lock/pid \
+    "$HOME_DIR"/profiles/*/.coord-lock/pid \
+    "$HOME_DIR"/profiles/*/session-users/* \
+    "$HOME_DIR"/session.*/owner.pid; do
+    [ -f "$file" ] || continue
+    case "$file" in
+      */session-users/*) pid=${file##*/} ;;
+      *) pid=$(cat "$file" 2>/dev/null || true) ;;
+    esac
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if [ "$pid" != "$$" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "qbraid-code: session or installer process $pid is still using this installation." >&2
+      echo 'Exit every qbraid-code session, then run uninstall again.' >&2
+      return 0
+    fi
+  done
+  return 1
+}
+
+preflight_secret_cleanup() {
+  local env_file backend ref secret_name
+  while IFS= read -r env_file; do
+    backend=$(env_field "$env_file" QBRAID_CODE_SECRET_BACKEND)
+    ref=$(env_field "$env_file" QBRAID_CODE_SECRET_REF)
+    [ -n "$backend" ] || continue
+    [ -n "$ref" ] || { echo "qbraid-code: missing secret reference in $env_file" >&2; return 1; }
+    case "$backend" in
+      keychain)
+        command -v security >/dev/null 2>&1 || {
+          echo "qbraid-code: macOS Keychain is unavailable; local key '$ref' was not removed." >&2
+          return 1
+        } ;;
+      secret-service)
+        command -v secret-tool >/dev/null 2>&1 || {
+          echo "qbraid-code: secret-tool is unavailable; local key '$ref' was not removed." >&2
+          return 1
+        } ;;
+      file)
+        case "$ref" in
+          "$HOME_DIR"/secrets/*)
+            secret_name=${ref#"$HOME_DIR"/secrets/}
+            case "$secret_name" in ''|*/*|.|..) echo "qbraid-code: refusing unsafe secret path '$ref'." >&2; return 1 ;; esac ;;
+          *) echo "qbraid-code: refusing unsafe secret path '$ref'." >&2; return 1 ;;
+        esac ;;
+      *)
+        echo "qbraid-code: unknown secret backend '$backend' in $env_file." >&2
+        return 1 ;;
+    esac
+  done <<EOF
+$(profile_env_files)
+EOF
+}
+
+delete_keychain_ref() {
+  local ref="$1" rc
+  if security delete-generic-password -s "$ref" >/dev/null 2>&1; then return 0; else rc=$?; fi
+  [ "$rc" -eq 44 ] && return 0
+  echo "qbraid-code: could not delete Keychain item '$ref'." >&2
+  return 1
+}
+
+delete_secret_service_ref() {
+  local ref="$1" error_file rc
+  error_file=$(mktemp "${TMPDIR:-/tmp}/qbraid-code-secret.XXXXXX") || return 1
+  chmod 600 "$error_file"
+  if secret-tool lookup service qbraid-code ref "$ref" >/dev/null 2>"$error_file"; then
+    if secret-tool clear service qbraid-code ref "$ref" >/dev/null 2>"$error_file"; then
+      rm -f "$error_file"
+      return 0
+    else
+      rc=$?
+    fi
+    printf 'qbraid-code: Secret Service could not delete %s (exit %s).
+' "$ref" "$rc" >&2
+    [ ! -s "$error_file" ] || cat "$error_file" >&2
+    rm -f "$error_file"
+    return 1
+  else
+    rc=$?
+  fi
+  if [ "$rc" -eq 1 ] && [ ! -s "$error_file" ]; then rm -f "$error_file"; return 0; fi
+  printf 'qbraid-code: Secret Service could not inspect %s (exit %s).
+' "$ref" "$rc" >&2
+  [ ! -s "$error_file" ] || cat "$error_file" >&2
+  rm -f "$error_file"
+  return 1
+}
+
+remove_local_secrets() {
+  local env_file backend ref failure=0 seen=""
+  while IFS= read -r env_file; do
+    backend=$(env_field "$env_file" QBRAID_CODE_SECRET_BACKEND)
+    ref=$(env_field "$env_file" QBRAID_CODE_SECRET_REF)
+    [ -n "$backend" ] && [ -n "$ref" ] || continue
+    case "\n$seen" in *"\n$backend|$ref\n"*) continue ;; esac
+    seen="${seen}${backend}|${ref}\n"
+    case "$backend" in
+      keychain) delete_keychain_ref "$ref" || failure=1 ;;
+      secret-service) delete_secret_service_ref "$ref" || failure=1 ;;
+      file) rm -f -- "$ref" || failure=1 ;;
+    esac
+  done <<EOF
+$(profile_env_files)
+EOF
+  [ "$failure" -eq 0 ]
+}
+
+remove_orphaned_store_secrets() {
+  local ref cleared=0 error_file rc
+  if command -v security >/dev/null 2>&1; then
+    if ! security dump-keychain 2>/dev/null \
+      | sed -n 's/^[[:space:]]*"svce"<blob>="\(qbraid-code:[A-Za-z0-9._:-]*\)".*/\1/p' \
+      | while IFS= read -r ref; do
+          [ -z "$ref" ] || delete_keychain_ref "$ref" || exit 1
+        done
+    then
+      echo 'qbraid-code: could not inspect or delete qbraid-code Keychain items.' >&2
+      return 1
+    fi
+  fi
+  if command -v secret-tool >/dev/null 2>&1; then
+    error_file=$(mktemp "${TMPDIR:-/tmp}/qbraid-code-secret.XXXXXX") || return 1
+    chmod 600 "$error_file"
+    while [ "$cleared" -lt 100 ]; do
+      if secret-tool clear service qbraid-code >/dev/null 2>"$error_file"; then
+        cleared=$((cleared + 1))
+        : > "$error_file"
+        continue
+      else
+        rc=$?
+      fi
+      if [ "$rc" -eq 1 ] && [ ! -s "$error_file" ]; then rm -f "$error_file"; return 0; fi
+      printf 'qbraid-code: Secret Service cleanup failed (exit %s).\n' "$rc" >&2
+      [ ! -s "$error_file" ] || cat "$error_file" >&2
+      rm -f "$error_file"
+      return 1
+    done
+    rm -f "$error_file"
+    echo 'qbraid-code: more than 100 Secret Service entries remain; run uninstall again.' >&2
+    return 1
+  fi
+}
+
+json_filter() {
+  local path="$1" first="$2" second="$3" needle="$4" output="$5"
+  QC_JSON_NEEDLE="$needle" awk -v first="$first" -v second="$second" '
+function ws(p, c) {
+  while (p <= length(text)) {
+    c = substr(text,p,1)
+    if (c != " " && c != "\t" && c != "\r" && c != "\n") break
+    p++
+  }
+  return p
+}
+function strend(p, c) {
+  if (substr(text,p,1) != "\"") return 0
+  p++
+  while (p <= length(text)) {
+    c = substr(text,p,1)
+    if (c == "\\") {
+      c = substr(text,p+1,1)
+      if (c == "u") { if (substr(text,p+2,4) !~ /^[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]$/) return 0; p += 6; continue }
+      if (c !~ /^["\\\/bfnrt]$/) return 0
+      p += 2; continue
+    }
+    if (c == "\"") return p
+    if (c == "\n" || c == "\r" || c == "\t") return 0
+    p++
+  }
+  return 0
+}
+function valend(p, c, stack, top, expected, e, token, start) {
+  p = ws(p); c = substr(text,p,1)
+  if (c == "\"") return strend(p)
+  if (c == "{" || c == "[") {
+    stack = c; p++
+    while (p <= length(text)) {
+      c = substr(text,p,1)
+      if (c == "\"") { e = strend(p); if (!e) return 0; p = e + 1; continue }
+      if (c == "{" || c == "[") stack = stack c
+      else if (c == "}" || c == "]") {
+        top = substr(stack,length(stack),1); expected = (top == "{" ? "}" : "]")
+        if (c != expected) return 0
+        stack = substr(stack,1,length(stack)-1)
+        if (length(stack) == 0) return p
+      }
+      p++
+    }
+    return 0
+  }
+  start = p; e = p - 1
+  while (p <= length(text)) {
+    c = substr(text,p,1)
+    if (c == "," || c == "}" || c == "]") break
+    if (c != " " && c != "\t" && c != "\r" && c != "\n") e = p
+    p++
+  }
+  token = substr(text,start,e-start+1)
+  if (token !~ /^(true|false|null|-?(0|[1-9][0-9]*)(\.[0-9][0-9]*)?([eE][+-]?[0-9][0-9]*)?)$/) return 0
+  return e
+}
+function validvalue(p, c, e, keyend, colon, tokenstart, tokenend, token) {
+  p = ws(p); c = substr(text,p,1)
+  if (c == "\"") { e = strend(p); if (!e) return 0; valid_end=e; return 1 }
+  if (c == "{") {
+    p = ws(p+1)
+    if (substr(text,p,1) == "}") { valid_end=p; return 1 }
+    while (p <= length(text)) {
+      keyend = strend(p); if (!keyend) return 0
+      colon = ws(keyend+1); if (substr(text,colon,1) != ":") return 0
+      if (!validvalue(colon+1)) return 0
+      p = ws(valid_end+1); c = substr(text,p,1)
+      if (c == "}") { valid_end=p; return 1 }
+      if (c != ",") return 0
+      p = ws(p+1)
+    }
+    return 0
+  }
+  if (c == "[") {
+    p = ws(p+1)
+    if (substr(text,p,1) == "]") { valid_end=p; return 1 }
+    while (p <= length(text)) {
+      if (!validvalue(p)) return 0
+      p = ws(valid_end+1); c = substr(text,p,1)
+      if (c == "]") { valid_end=p; return 1 }
+      if (c != ",") return 0
+      p = ws(p+1)
+    }
+    return 0
+  }
+  tokenstart=p; tokenend=p-1
+  while (p <= length(text)) {
+    c=substr(text,p,1)
+    if (c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\r" || c == "\n") break
+    tokenend=p; p++
+  }
+  if (tokenend < tokenstart) return 0
+  token=substr(text,tokenstart,tokenend-tokenstart+1)
+  if (token !~ /^(true|false|null|-?(0|[1-9][0-9]*)(\.[0-9][0-9]*)?([eE][+-]?[0-9][0-9]*)?)$/) return 0
+  valid_end=tokenend; return 1
+}
+function member(openpos, wanted, limit, p, prevcomma, start, ke, name, colon, vs, ve, after) {
+  if (substr(text,openpos,1) != "{") { invalid=1; return 0 }
+  p = openpos + 1; prevcomma = 0
+  while (p <= limit) {
+    p = ws(p)
+    if (substr(text,p,1) == "}") return 0
+    start = p; ke = strend(p)
+    if (!ke) { invalid=1; return 0 }
+    name = substr(text,p+1,ke-p-1)
+    if (index(name, "\\") != 0) { invalid=1; return 0 }
+    colon = ws(ke+1)
+    if (substr(text,colon,1) != ":") { invalid=1; return 0 }
+    vs = ws(colon+1); ve = valend(vs)
+    if (!ve || ve < vs || ve > limit) { invalid=1; return 0 }
+    after = ws(ve+1)
+    if (name == wanted) {
+      if (found) { invalid=1; return 0 }
+      found=1; found_vs=vs; found_ve=ve
+      if (substr(text,after,1) == ",") { remove_start=start; remove_end=after }
+      else if (substr(text,after,1) == "}") { remove_start=(prevcomma ? prevcomma : start); remove_end=ve }
+      else { invalid=1; return 0 }
+    }
+    if (substr(text,after,1) == ",") { prevcomma=after; p=after+1; continue }
+    if (substr(text,after,1) == "}") return found
+    invalid=1; return 0
+  }
+  invalid=1; return 0
+}
+{
+  text = text $0 ORS
+}
+END {
+  needle = ENVIRON["QC_JSON_NEEDLE"]
+  root = ws(1)
+  if (!validvalue(root) || substr(text,root,1) != "{") { exit 2 }
+  rootend = valid_end
+  tail = ws(rootend+1)
+  if (tail <= length(text) && substr(text,tail) !~ /^[[:space:]]*$/) { exit 2 }
+  invalid=0; found=0
+  member(root, first, rootend)
+  if (invalid) exit 2
+  if (!found) { exit 4 }
+  if (second != "") {
+    parent_vs=found_vs; parent_ve=found_ve
+    found=0; remove_start=0; remove_end=0
+    member(parent_vs, second, parent_ve)
+    if (invalid) exit 2
+    if (!found) { exit 4 }
+  }
+  if (needle != "" && index(substr(text,found_vs,found_ve-found_vs+1), needle) == 0) {
+    exit 4
+  }
+  printf "%s%s", substr(text,1,remove_start-1), substr(text,remove_end+1)
+}
+' "$path" > "$output"
+}
+
+json_check() {
+  local path="$1" first="$2" second="$3" needle="$4" backup artifact cleaned=0 rc
+  backup="$path.qbraid-code-uninstall.backup"
+  for artifact in "$path".qbraid-code-uninstall.* "$path".qbraid-code-snapshot.*; do
+    [ "$artifact" = "$backup" ] && continue
+    [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+    [ -f "$artifact" ] && [ ! -L "$artifact" ] || {
+      echo "qbraid-code: refusing unexpected JSON temporary $artifact" >&2
+      return 1
+    }
+    rm -f "$artifact" || return 1
+    cleaned=1
+  done
+  if [ -e "$backup" ] || [ -L "$backup" ]; then
+    [ -f "$backup" ] && [ ! -L "$backup" ] || {
+      echo "qbraid-code: refusing unexpected JSON backup at $backup" >&2
+      return 1
+    }
+    if [ ! -e "$path" ]; then
+      if ln "$backup" "$path" 2>/dev/null; then
+        rm -f "$backup" || return 1
+        echo "qbraid-code: recovered $path from an interrupted update. Retry uninstall." >&2
+      else
+        echo "qbraid-code: $path changed during recovery. Retry to preserve the newer settings." >&2
+      fi
+      return 1
+    fi
+    [ -f "$path" ] && [ ! -L "$path" ] || {
+      echo "qbraid-code: refusing unsafe JSON file $path" >&2
+      return 1
+    }
+    if json_filter "$path" "$first" "$second" "$needle" /dev/null; then rc=0; else rc=$?; fi
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 4 ]; then
+      echo "qbraid-code: unexpected JSON backup at $backup; current JSON is invalid." >&2
+      return 1
+    fi
+    rm -f "$backup" || return 1
+    echo "qbraid-code: removed an interrupted-update backup beside $path. Retry uninstall." >&2
+    return 1
+  fi
+  if [ "$cleaned" -eq 1 ]; then
+    echo "qbraid-code: removed interrupted-update temporaries beside $path. Retry uninstall." >&2
+    return 1
+  fi
+  [ -f "$path" ] || return 0
+  [ ! -L "$path" ] || { echo "qbraid-code: refusing symbolic-link JSON file $path" >&2; return 1; }
+  if json_filter "$path" "$first" "$second" "$needle" /dev/null; then
+    return 0
+  else
+    rc=$?
+  fi
+  [ "$rc" -eq 4 ] && return 0
+  echo "qbraid-code: cannot safely update invalid JSON at $path" >&2
+  return 1
+}
+
+json_rewrite() {
+  local path="$1" first="$2" second="$3" needle="$4" tmp snapshot backup mode rc
+  backup="$path.qbraid-code-uninstall.backup"
+  if [ -e "$backup" ] || [ -L "$backup" ]; then
+    if [ ! -e "$path" ] && [ -f "$backup" ] && [ ! -L "$backup" ]; then
+      if ln "$backup" "$path" 2>/dev/null; then
+        rm -f "$backup" || return 1
+        echo "qbraid-code: recovered $path from an interrupted update. Retry uninstall." >&2
+      else
+        echo "qbraid-code: $path changed during recovery. Retry to preserve the newer settings." >&2
+      fi
+    else
+      echo "qbraid-code: unexpected JSON backup at $backup; refusing uninstall." >&2
+    fi
+    return 1
+  fi
+  [ -f "$path" ] || return 0
+  [ ! -L "$path" ] || { echo "qbraid-code: refusing symbolic-link JSON file $path" >&2; return 1; }
+  tmp=$(mktemp "$path.qbraid-code-uninstall.XXXXXX") || {
+    echo "qbraid-code: could not create a private update beside $path" >&2
+    return 1
+  }
+  snapshot=$(mktemp "$path.qbraid-code-snapshot.XXXXXX") || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" "$snapshot" || { rm -f "$tmp" "$snapshot"; return 1; }
+  if ! cat "$path" > "$snapshot"; then rm -f "$tmp" "$snapshot"; return 1; fi
+  if json_filter "$snapshot" "$first" "$second" "$needle" "$tmp"; then
+    mode=$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)
+    if [ -n "$mode" ] && ! chmod "$mode" "$tmp"; then
+      rm -f "$tmp" "$snapshot"
+      echo "qbraid-code: could not preserve permissions for $path" >&2
+      return 1
+    fi
+    if ! mv "$path" "$backup"; then rm -f "$tmp" "$snapshot"; return 1; fi
+    if ! cmp -s "$snapshot" "$backup"; then
+      if [ ! -e "$path" ] && ln "$backup" "$path" 2>/dev/null; then rm -f "$backup"; fi
+      rm -f "$tmp" "$snapshot"
+      echo "qbraid-code: $path changed during uninstall. Retry to preserve the newer settings." >&2
+      return 1
+    fi
+    if ln "$tmp" "$path" 2>/dev/null; then
+      rm -f "$tmp" "$snapshot" "$backup"
+      return 0
+    fi
+    rm -f "$tmp" "$snapshot"
+    if [ -e "$path" ]; then
+      rm -f "$backup"
+    elif ln "$backup" "$path" 2>/dev/null; then
+      rm -f "$backup"
+    fi
+    echo "qbraid-code: $path changed during uninstall. Retry to preserve the newer settings." >&2
+    return 1
+  else
+    rc=$?
+  fi
+  rm -f "$tmp" "$snapshot"
+  [ "$rc" -eq 4 ] && return 0
+  echo "qbraid-code: could not safely update $path" >&2
+  return 1
+}
+
+statusline_json_needle() {
+  local quoted
+  quoted=$(
+    printf "'"
+    printf '%s' "$HOME_DIR/statusline.sh" | sed 's/'"'"'/'"'"'\\'"'"''"'"'/g'
+    printf "'"
+  )
+  printf '%s' "$quoted" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+}
+
+preflight_claude_integrations() {
+  local settings="$HOME/.claude/settings.json" claude_json="$HOME/.claude.json" needle
+  needle=$(statusline_json_needle)
+  json_check "$settings" statusLine '' "$needle" || return 1
+  json_check "$claude_json" mcpServers qbraid '' || return 1
+}
+
+cleanup_claude_integrations() {
+  local settings="$HOME/.claude/settings.json" claude_json="$HOME/.claude.json" needle
+  needle=$(statusline_json_needle)
+  json_rewrite "$settings" statusLine '' "$needle" || return 1
+  json_rewrite "$claude_json" mcpServers qbraid '' || return 1
+}
+
+uninstall_qbraid_code() {
+  local assume_yes="$1" reply="" script_source script_dir script_file sidecar sidecar_home="" bound=0 runtime pid managed_link
+  local normalized_home lexical_home physical_home physical_install install_parent install_name default_home marker_value="" has_sidecar=0
+  case "$HOME_DIR" in /*) ;; *) echo 'qbraid-code: installation path is not absolute; refusing uninstall.' >&2; return 1 ;; esac
+  normalized_home=$(printf '%s' "$HOME_DIR" | sed 's#//*#/#g')
+  while [ "$normalized_home" != / ] && [ "${normalized_home%/}" != "$normalized_home" ]; do normalized_home=${normalized_home%/}; done
+  HOME_DIR="$normalized_home"
+  [ "$HOME_DIR" != / ] || { echo "qbraid-code: unsafe installation path '$HOME_DIR'; refusing uninstall." >&2; return 1; }
+  [ ! -L "$HOME_DIR" ] || { echo "qbraid-code: installation path is a symlink; remove it manually." >&2; return 1; }
+  case "/$HOME_DIR/" in */../*|*/./*)
+    echo "qbraid-code: installation path contains dot segments; refusing uninstall." >&2
+    return 1 ;;
+  esac
+  lexical_home=$(printf '%s' "${HOME%/}" | sed 's#//*#/#g')
+  [ -n "$lexical_home" ] || lexical_home=/
+  default_home="$lexical_home/.qbraid-code"
+  physical_home=$(CDPATH='' cd -- "$HOME" 2>/dev/null && pwd -P) || {
+    echo 'qbraid-code: could not resolve the user home directory.' >&2
+    return 1
+  }
+  if [ -e "$HOME_DIR" ]; then
+    [ -d "$HOME_DIR" ] || { echo 'qbraid-code: installation path is not a directory.' >&2; return 1; }
+    physical_install=$(CDPATH='' cd -- "$HOME_DIR" 2>/dev/null && pwd -P) || physical_install=""
+  else
+    install_parent=$(dirname -- "$HOME_DIR")
+    install_name=$(basename -- "$HOME_DIR")
+    physical_install=$(CDPATH='' cd -- "$install_parent" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$install_name") || physical_install=""
+  fi
+  if [ "$HOME_DIR" != "$default_home" ] && [ "$physical_install" != "$HOME_DIR" ]; then
+    echo 'qbraid-code: custom installation path uses a symbolic-link component or alias; refusing uninstall.' >&2
+    return 1
+  fi
+  [ "$physical_install" != "$physical_home" ] || {
+    echo "qbraid-code: installation path resolves to the user home; refusing uninstall." >&2
+    return 1
+  }
+  if [ -d "$HOME_DIR" ]; then
+    command -v find >/dev/null 2>&1 || { echo 'qbraid-code: find is required to verify uninstall paths.' >&2; return 1; }
+    managed_link=$(find "$HOME_DIR" -type l -print -quit 2>/dev/null) || {
+      echo 'qbraid-code: could not verify uninstall paths.' >&2
+      return 1
+    }
+    [ -z "$managed_link" ] || {
+      echo "qbraid-code: refusing to traverse symbolic link '$managed_link'." >&2
+      return 1
+    }
+  fi
+
+  script_source=${BASH_SOURCE[0]}
+  script_dir=$(CDPATH='' cd -- "$(dirname -- "$script_source")" 2>/dev/null && pwd -P) || script_dir=""
+  script_file="$script_dir/$(basename -- "$script_source")"
+  sidecar="$script_file.home"
+  if [ -f "$sidecar" ]; then
+    has_sidecar=1
+    IFS= read -r sidecar_home < "$sidecar" || true
+    sidecar_home=$(printf '%s' "$sidecar_home" | sed 's#//*#/#g')
+    while [ "$sidecar_home" != / ] && [ "${sidecar_home%/}" != "$sidecar_home" ]; do sidecar_home=${sidecar_home%/}; done
+    [ "$sidecar_home" = "$HOME_DIR" ] && bound=1
+    [ "$bound" -eq 1 ] || { echo 'installation is not bound by this launcher; refusing uninstall.' >&2; return 1; }
+  fi
+  if [ "$HOME_DIR" != "$default_home" ]; then
+    [ "$has_sidecar" -eq 1 ] && [ "$bound" -eq 1 ] || {
+      echo 'qbraid-code: custom installation is not bound by this launcher; refusing uninstall.' >&2
+      return 1
+    }
+    if [ -d "$HOME_DIR" ]; then
+      marker_value=$(cat "$HOME_DIR/.qbraid-code-install" 2>/dev/null || true)
+      [ "$marker_value" = qbraid-code ] || {
+        echo 'qbraid-code: custom installation lacks its ownership marker. Re-run the installer before uninstalling.' >&2
+        return 1
+      }
+    fi
+  fi
+
+  if [ "$assume_yes" -ne 1 ]; then
+    if ! (exec 3</dev/tty) 2>/dev/null || ! (exec 3>/dev/tty) 2>/dev/null; then
+      echo 'qbraid-code: uninstall needs a terminal. Re-run with --uninstall --yes.' >&2
+      return 1
+    fi
+    printf 'Type uninstall to delete local qbraid-code profiles, keys, and files: ' > /dev/tty
+    IFS= read -r reply < /dev/tty || true
+    [ "$reply" = uninstall ] || { echo 'qbraid-code: uninstall cancelled.' >&2; return 1; }
+  fi
+
+  trap cleanup_uninstall_locks EXIT
+  trap 'cleanup_uninstall_locks; exit 130' INT
+  trap 'cleanup_uninstall_locks; exit 143' TERM
+  trap 'cleanup_uninstall_locks; exit 129' HUP
+  acquire_uninstall_locks || return 1
+  uninstall_has_live_work && return 1
+  preflight_secret_cleanup || return 1
+  preflight_claude_integrations || return 1
+
+  for runtime in "$HOME_DIR"/runtime.*; do
+    [ -d "$runtime" ] || continue
+    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true)
+    stop_owned_process "$pid" "$runtime/proxy-config.yaml" || return 1
+  done
+  pid=$(cat "$HOME_DIR/proxy.pid" 2>/dev/null || true)
+  stop_owned_process "$pid" "$HOME_DIR/proxy-config.yaml" || return 1
+
+  cleanup_claude_integrations || return 1
+  remove_local_secrets || return 1
+  remove_orphaned_store_secrets || return 1
+  rm -rf -- "$HOME_DIR" || return 1
+  [ ! -e "$HOME_DIR" ] || { echo "qbraid-code: could not remove $HOME_DIR" >&2; return 1; }
+
+  if [ "$bound" -eq 1 ]; then
+    rm -f -- "$sidecar" || return 1
+    rm -f -- "$script_file" || return 1
+  fi
+  echo 'qbraid-code: local installation removed. qBraid account API keys were not revoked.'
+}
+
+if [ "${1:-}" = --update-key ]; then
+  shift
+  [ "$#" -eq 0 ] || { echo 'qbraid-code: --update-key accepts no Claude arguments.' >&2; exit 1; }
+  if [ -z "$early_profile" ]; then
+    early_profile="${QBRAID_CODE_PROFILE:-}"
+    if [ -z "$early_profile" ] && [ -f "$HOME_DIR/active-profile" ]; then
+      IFS= read -r early_profile < "$HOME_DIR/active-profile" || true
+    fi
+    [ -n "$early_profile" ] || early_profile=default
+  fi
+  update_key "$early_profile"
+  exit $?
+fi
+if [ "${1:-}" = --uninstall ]; then
+  [ -z "$early_profile" ] || { echo 'qbraid-code: --uninstall removes every profile; omit --profile.' >&2; exit 1; }
+  shift
+  uninstall_yes=0
+  if [ "${1:-}" = --yes ]; then uninstall_yes=1; shift; fi
+  [ "$#" -eq 0 ] || { echo 'qbraid-code: --uninstall accepts only --yes.' >&2; exit 1; }
+  uninstall_qbraid_code "$uninstall_yes"
+  exit $?
+fi
+if [ -n "$early_profile" ]; then
+  set -- --profile "$early_profile" "$@"
+fi
 if [ -e "$HOME_DIR/profiles/default" ]; then
   if [ -f "$HOME_DIR/env" ] && grep -q '^QBRAID_CODE_TOKEN=' "$HOME_DIR/env"; then { grep -v '^QBRAID_CODE_TOKEN=' "$HOME_DIR/env" || true; } > "$HOME_DIR/env.clean.$$"; chmod 600 "$HOME_DIR/env.clean.$$"; mv "$HOME_DIR/env.clean.$$" "$HOME_DIR/env"; fi
   legacy_pid=$(cat "$HOME_DIR/proxy.pid" 2>/dev/null || true); legacy_command=""; keep_legacy_config=0
@@ -30,12 +894,6 @@ for stale_session in "$HOME_DIR"/session.*; do
   stale_owner=$(cat "$stale_session/owner.pid" 2>/dev/null || true)
   if [ -z "$stale_owner" ] || ! kill -0 "$stale_owner" 2>/dev/null; then rm -rf "$stale_session"; fi
 done
-
-valid_profile_slug() {
-  local LC_ALL=C
-  case "${1:-}" in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  [ "${#1}" -le 32 ]
-}
 
 profile_dir() {
   local root="$HOME_DIR/profiles/$1" generation
@@ -75,9 +933,10 @@ case "${1:-}" in
   --profiles) list_profiles; exit 0 ;;
   --use-profile)
     [ "$#" -ge 2 ] || { echo 'qbraid-code: --use-profile needs a name' >&2; exit 1; }
-    valid_profile_slug "$2" && profile_dir "$2" >/dev/null || {
-      echo "qbraid-code: invalid profile '$2'" >&2; exit 1;
-    }
+    if ! valid_profile_slug "$2" || ! profile_dir "$2" >/dev/null; then
+      echo "qbraid-code: invalid profile '$2'" >&2
+      exit 1
+    fi
     printf '%s\n' "$2" > "$HOME_DIR/active-profile.tmp.$$"
     mv "$HOME_DIR/active-profile.tmp.$$" "$HOME_DIR/active-profile"
     echo "qbraid-code: active profile is now $2"
@@ -101,10 +960,9 @@ if [ -z "$PROFILE_HOME" ]; then
 fi
 SESSION_LEASED=0
 acquire_session_lease() {
-  local i=0 owner update_owner
+  local i=0 update_owner
   while [ "$i" -lt 200 ]; do
-    if mkdir "$PROFILE_ROOT/.coord-lock" 2>/dev/null; then
-      printf '%s\n' "$$" > "$PROFILE_ROOT/.coord-lock/pid"
+    if try_acquire_lock_dir "$PROFILE_ROOT/.coord-lock"; then
       if [ -d "$PROFILE_ROOT/.update-lock" ]; then
         update_owner=$(cat "$PROFILE_ROOT/.update-lock/pid" 2>/dev/null || true)
         if [ -n "$update_owner" ] && kill -0 "$update_owner" 2>/dev/null; then
@@ -118,8 +976,6 @@ acquire_session_lease() {
       SESSION_LEASED=1
       return 0
     fi
-    owner=$(cat "$PROFILE_ROOT/.coord-lock/pid" 2>/dev/null || true)
-    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$PROFILE_ROOT/.coord-lock"; fi
     i=$((i + 1)); sleep 0.3
   done
   echo "qbraid-code: profile '$PROFILE' is being updated. Try again shortly." >&2
@@ -187,38 +1043,31 @@ proxy_listening() {
 }
 
 scavenge_runtimes() {
-  local runtime owner pid command i
+  local runtime owner pid
   for runtime in "$HOME_DIR"/runtime.*; do
     [ -d "$runtime" ] || continue
     owner=$(cat "$runtime/owner.pid" 2>/dev/null || true)
     [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && continue
-    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true); command=""
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      if [ -r "/proc/$pid/cmdline" ]; then command=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-      elif command -v ps >/dev/null 2>&1; then command=$(ps -p "$pid" -o command= 2>/dev/null || true); fi
-      case "$command" in *"$runtime/proxy-config.yaml"*) kill "$pid" 2>/dev/null || true; i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true ;; esac
-    fi
+    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true)
+    if ! stop_owned_process "$pid" "$runtime/proxy-config.yaml"; then continue; fi
     rm -rf "$runtime"
   done
 }
 
 prepare_proxy_runtime() {
-  local candidate owner line auth_escaped
+  local candidate line auth_escaped
   scavenge_runtimes
   mkdir -p "$HOME_DIR/ports"
   chmod 700 "$HOME_DIR/ports" 2>/dev/null || true
   candidate=$PROXY_PORT
   while [ "$candidate" -le 8999 ]; do
     if { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || { [ -x /usr/sbin/lsof ] && /usr/sbin/lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || { command -v nc >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 "$candidate" >/dev/null 2>&1; } || (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then candidate=$((candidate + 1)); continue; fi
-    if mkdir "$HOME_DIR/ports/$candidate" 2>/dev/null; then
-      printf '%s\n' "$$" > "$HOME_DIR/ports/$candidate/pid"
+    if try_acquire_lock_dir "$HOME_DIR/ports/$candidate"; then
       PORT_LOCK="$HOME_DIR/ports/$candidate"
       PROXY_PORT=$candidate
       PROXY_URL="http://127.0.0.1:$PROXY_PORT"
       break
     fi
-    owner=$(cat "$HOME_DIR/ports/$candidate/pid" 2>/dev/null || true)
-    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$HOME_DIR/ports/$candidate"; continue; fi
     candidate=$((candidate + 1))
   done
   [ -n "$PORT_LOCK" ] || { echo 'qbraid-code: no local proxy port is available.' >&2; return 1; }
@@ -241,25 +1090,39 @@ prepare_proxy_runtime() {
 }
 
 cleanup_proxy() {
-  local i=0
-  if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
-    kill "$PROXY_PID" 2>/dev/null || true
-    while kill -0 "$PROXY_PID" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-    kill -0 "$PROXY_PID" 2>/dev/null && kill -KILL "$PROXY_PID" 2>/dev/null || true
+  local owned=0
+  if stop_owned_process "$PROXY_PID" "$RUNTIME_DIR/proxy-config.yaml"; then owned=1; fi
+  if [ "$owned" -eq 1 ]; then
+    [ -z "$RUNTIME_DIR" ] || rm -rf "$RUNTIME_DIR"
+    [ -z "$PORT_LOCK" ] || rm -rf "$PORT_LOCK"
   fi
-  [ -z "$RUNTIME_DIR" ] || rm -rf "$RUNTIME_DIR"
-  [ -z "$PORT_LOCK" ] || rm -rf "$PORT_LOCK"
   PROXY_PID=""; RUNTIME_DIR=""; PORT_LOCK=""; RUNTIME_LOCAL_KEY=""
 }
 
 start_proxy() {
+  local i=0 expected_executable actual_executable verified=0
   [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] || { echo 'qbraid-code: local proxy is not installed.' >&2; return 1; }
+  proxy_binary_is_native "$PROXY_BIN" || { echo 'qbraid-code: proxy wrapper scripts are unsafe. Re-run the installer.' >&2; return 1; }
   [ -s "$PROFILE_HOME/proxy-template.yaml" ] || { echo 'qbraid-code: proxy template missing. Re-run the installer.' >&2; return 1; }
   prepare_proxy_runtime || return 1
   "$PROXY_BIN" -config "$RUNTIME_DIR/proxy-config.yaml" >> "$RUNTIME_DIR/proxy.log" 2>&1 &
   PROXY_PID=$!
   printf '%s\n' "$PROXY_PID" > "$RUNTIME_DIR/proxy.pid"
-  local i=0
+  expected_executable=$(canonical_executable "$PROXY_BIN" 2>/dev/null || true)
+  while [ "$i" -lt 20 ]; do
+    kill -0 "$PROXY_PID" 2>/dev/null || break
+    actual_executable=$(process_executable "$PROXY_PID")
+    if [ -n "$expected_executable" ] && [ "$actual_executable" = "$expected_executable" ]; then verified=1; break; fi
+    sleep 0.05; i=$((i + 1))
+  done
+  if [ "$verified" -ne 1 ]; then
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+    echo 'qbraid-code: could not verify the newly started local proxy executable.' >&2
+    cleanup_proxy
+    return 1
+  fi
+  i=0
   while [ "$i" -lt 40 ]; do
     if proxy_listening; then return 0; fi
     kill -0 "$PROXY_PID" 2>/dev/null || break
@@ -272,23 +1135,16 @@ start_proxy() {
 }
 
 stop_all_proxies() {
-  local runtime pid command i
+  local runtime pid owner failed=0
   for runtime in "$HOME_DIR"/runtime.*; do
     [ -d "$runtime" ] || continue
-    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true)
-    command=""
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      if [ -r "/proc/$pid/cmdline" ]; then command=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
-      elif command -v ps >/dev/null 2>&1; then command=$(ps -p "$pid" -o command= 2>/dev/null || true); fi
-      case "$command" in *"$runtime/proxy-config.yaml"*)
-        kill "$pid" 2>/dev/null || true; i=0
-        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true ;;
-      esac
-    fi
     owner=$(cat "$runtime/owner.pid" 2>/dev/null || true)
-    if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then rm -rf "$runtime"; fi
+    [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null || continue
+    pid=$(cat "$runtime/proxy.pid" 2>/dev/null || true)
+    if ! stop_owned_process "$pid" "$runtime/proxy-config.yaml"; then failed=1; continue; fi
+    rm -rf "$runtime"
   done
+  [ "$failed" -eq 0 ]
 }
 
 # The requested model decides the route: an explicit --model wins over the
@@ -372,9 +1228,12 @@ missing_keys() {
 
 case "${1:-}" in
   --stop)
-    stop_all_proxies
-    echo "qbraid-code: local proxies stopped"
-    exit 0 ;;
+    if stop_all_proxies; then
+      echo "qbraid-code: orphaned local proxies stopped"
+      exit 0
+    fi
+    echo "qbraid-code: some proxy processes could not be verified or stopped." >&2
+    exit 1 ;;
   --doctor)
     CLAUDE_VERSION=""; CLAUDE_STATUS=missing
     MCP_ADD=no; MCP_GET=no; MCP_LOGIN=no; MCP_HTTP=no; MCP_USER_SCOPE=no
@@ -418,6 +1277,7 @@ case "${1:-}" in
       BODY=$(cat "$TMP"); rm -f "$TMP"
       case "$STATUS" in
         200)
+          rm -f "$PROFILE_HOME/key-status"
           # pipefail + set -e would kill --doctor silently if the field is absent.
           RAW=$(set +o pipefail; printf '%s' "$BODY" | grep -o '"qbraidCredits":-\?[0-9.]*' | head -1 | sed 's/.*://')
           CREDITS=$(awk -v c="$RAW" 'BEGIN { printf "%.0f", c }' 2>/dev/null) || CREDITS="$RAW"
@@ -425,7 +1285,10 @@ case "${1:-}" in
           echo "credits:  ${CREDITS:-unknown}"
           ;;
         401|403)
+          printf 'expired\n' > "$PROFILE_HOME/key-status.tmp.$$"
+          mv "$PROFILE_HOME/key-status.tmp.$$" "$PROFILE_HOME/key-status"
           echo "key:      REJECTED — make a new one at https://account.qbraid.com/account/api-keys"
+          echo "replace:  qbraid-code --profile $PROFILE --update-key"
           echo "credits:  unknown"
           ;;
         000)
@@ -474,24 +1337,6 @@ case "${1:-}" in
       echo "proxy:    NOT AVAILABLE — re-run the installer"
     fi
     exit 0 ;;
-  --help|-h)
-    cat <<EOF
-qbraid-code — Claude Code, powered by the qBraid AI gateway.
-
-  qbraid-code [claude args...]        start a session
-  qbraid-code --profile NAME [...]    bind one session to NAME
-  qbraid-code --profiles              list profiles
-  qbraid-code --use-profile NAME      select future sessions
-  qbraid-code --doctor                check the bound profile
-  qbraid-code --stop                  stop orphaned local proxies
-
-Any other arguments are passed straight through to \`claude\`, so
-\`-c\`, \`--allowedTools\`, \`--model\`, and the rest behave normally.
-
-Default model: ${MODEL:-not set}
-Change it by editing $PROFILE_HOME/env, or pass --model.
-EOF
-    exit 0 ;;
 esac
 
 MISSING=$(missing_keys)
@@ -522,6 +1367,7 @@ CREDIT_TMP=$(mktemp)
 CREDIT_STATUS=$(printf 'header = "X-API-Key: %s"\n' "$TOKEN" |
   curl -sS -m 8 -o "$CREDIT_TMP" -w '%{http_code}' --config - "$API_BASE/billing/credits/balance" 2>/dev/null) || CREDIT_STATUS=000
 if [ "$CREDIT_STATUS" = 200 ]; then
+  rm -f "$PROFILE_HOME/key-status"
   CREDIT_VALUE=$(set +o pipefail; grep -o '"qbraidCredits":-\?[0-9.]*' "$CREDIT_TMP" | head -1 | sed 's/.*://')
   if [ -n "$CREDIT_VALUE" ]; then
     printf '%s\n' "$CREDIT_VALUE" > "$PROFILE_HOME/credits.cache.tmp.$$"
@@ -529,6 +1375,9 @@ if [ "$CREDIT_STATUS" = 200 ]; then
     date +%s > "$PROFILE_HOME/credits.updated.tmp.$$"
     mv "$PROFILE_HOME/credits.updated.tmp.$$" "$PROFILE_HOME/credits.updated"
   fi
+elif [ "$CREDIT_STATUS" = 401 ] || [ "$CREDIT_STATUS" = 403 ]; then
+  printf 'expired\n' > "$PROFILE_HOME/key-status.tmp.$$"
+  mv "$PROFILE_HOME/key-status.tmp.$$" "$PROFILE_HOME/key-status"
 fi
 rm -f "$CREDIT_TMP"
 RUN_BASE="$BASE_URL"
@@ -565,7 +1414,7 @@ fi
 SESSION_DIR=$(mktemp -d "$HOME_DIR/session.$PROFILE.XXXXXX")
 chmod 700 "$SESSION_DIR"
 printf '%s\n' "$$" > "$SESSION_DIR/owner.pid"
-for status_file in label label-source organization-id credits.cache credits.updated; do
+for status_file in label label-source organization-id credits.cache credits.updated key-status; do
   [ ! -f "$PROFILE_HOME/$status_file" ] || cp "$PROFILE_HOME/$status_file" "$SESSION_DIR/$status_file"
 done
 [ -f "$SESSION_DIR/label" ] || printf '%s\n' "$PROFILE" > "$SESSION_DIR/label"

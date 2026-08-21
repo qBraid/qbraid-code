@@ -36,14 +36,7 @@ while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w) status=1; shif
 if [ "$status" -eq 0 ] && [ -n "${CAPTURE_PROXY_CONFIG:-}" ]; then i=0; while [ ! -f "$CAPTURE_PROXY_CONFIG" ] && [ "$i" -lt 50 ]; do sleep 0.02; i=$((i + 1)); done; fi
 [ "$status" -eq 0 ] || printf 200
 EOF
-cat > "$BIN/cliproxyapi" <<'EOF'
-#!/usr/bin/env bash
-[ -z "${CAPTURE_PROXY_CONFIG:-}" ] || cp "$2" "$CAPTURE_PROXY_CONFIG"
-sleep 0.4
-[ -f "$2" ] || exit 42
-[ -z "${PROXY_WATCHER_READY:-}" ] || printf 'ready\n' > "$PROXY_WATCHER_READY"
-while :; do sleep 60; done
-EOF
+cc tests/fake-proxy.c -o "$BIN/cliproxyapi"
 chmod +x "$BIN/curl" "$BIN/cliproxyapi"
 cat > "$BIN/claude" <<'EOF'
 #!/usr/bin/env bash

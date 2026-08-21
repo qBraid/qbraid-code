@@ -43,12 +43,9 @@ cat > "$BIN/curl" <<'EOF'
 out=""; status=0
 while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w) status=1; shift 2;; --config|-m) shift 2;; *) shift;; esac; done
 [ -z "$out" ] || printf '{}' > "$out"
-[ "$status" -eq 0 ] || printf 200
+[ "$status" -eq 0 ] || printf '%s' "${CREDIT_STATUS:-200}"
 EOF
-cat > "$BIN/cliproxyapi" <<'EOF'
-#!/usr/bin/env bash
-while :; do sleep 60; done
-EOF
+cc tests/fake-proxy.c -o "$BIN/cliproxyapi"
 chmod +x "$BIN/curl" "$BIN/cliproxyapi"
 cat > "$BIN/claude" <<'EOF'
 #!/usr/bin/env bash
@@ -80,6 +77,19 @@ contains "$out" 'args=<-p><hello world><--allowedTools><Read Bash>' &&
 contains "$out" '<--setting-sources><user>' \
   && ok 'active profile binds once, excludes project settings, and preserves Claude args' \
   || bad 'active profile binding or argument preservation' "$out"
+
+CREDIT_STATUS=401 bash qbraid-code --profile alpha -p rejected >/dev/null
+if [ "$(cat "$QC_HOME/profiles/alpha/key-status" 2>/dev/null)" = expired ]; then
+  ok 'confirmed key rejection is cached for the statusline'
+else
+  bad 'confirmed key rejection was not cached'
+fi
+CREDIT_STATUS=200 bash qbraid-code --profile alpha -p recovered >/dev/null
+if [ ! -e "$QC_HOME/profiles/alpha/key-status" ]; then
+  ok 'successful key check clears the expired marker'
+else
+  bad 'successful key check left the expired marker'
+fi
 
 out=$(bash qbraid-code --profile beta -p beta-question)
 contains "$out" "profile_home=$QC_HOME/session.beta." &&

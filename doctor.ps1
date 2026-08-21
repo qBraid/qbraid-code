@@ -109,6 +109,7 @@ Write-Host "capabilities: mcp-add=$($mcpAdd.ToString().ToLower()) mcp-get=$($mcp
 try {
     $balance = Invoke-RestMethod -Uri "$apiBase/billing/credits/balance" `
         -Headers @{ 'X-API-Key' = $token } -TimeoutSec 20
+    Remove-Item (Join-Path $ProfileDir 'key-status') -Force -ErrorAction SilentlyContinue
     Write-Host 'key:      valid'
     $raw = $balance.data.qbraidCredits
     if ($null -ne $raw) {
@@ -120,7 +121,10 @@ try {
     $status = $null
     if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
     if ($status -eq 401 -or $status -eq 403) {
+        [IO.File]::WriteAllText((Join-Path $ProfileDir 'key-status'), 'expired', (New-Object Text.UTF8Encoding $false))
         Write-Host 'key:      REJECTED - make a new one at https://account.qbraid.com/account/api-keys'
+        $selectedProfile = if ($env:QBRAID_CODE_PROFILE) { $env:QBRAID_CODE_PROFILE } else { 'default' }
+        Write-Host "replace:  qbraid-code --profile $selectedProfile --update-key"
     } elseif ($status) {
         Write-Host "key:      UNKNOWN - qBraid returned HTTP $status"
     } else {

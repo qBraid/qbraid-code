@@ -17,7 +17,8 @@
 #>
 param(
     [switch]$Global,
-    [string]$Profile = ''
+    [string]$Profile = '',
+    [switch]$UpdateKey
 )
 
 Set-StrictMode -Version Latest
@@ -81,7 +82,9 @@ function Get-Prop {
 function Confirm-Step {
     param([string]$Question, [string]$Default = 'y')
     $hint = if ($Default -eq 'y') { '[Y/n]' } else { '[y/N]' }
-    $reply = (Read-Host "$Question $hint").Trim().ToLower()
+    $reply = Read-Host "$Question $hint"
+    if ($null -eq $reply) { Warn "cannot confirm '$Question' without interactive input"; return $false }
+    $reply = $reply.Trim().ToLower()
     if ([string]::IsNullOrEmpty($reply)) { $reply = $Default }
     return ($reply -eq 'y' -or $reply -eq 'yes')
 }
@@ -94,11 +97,75 @@ function Write-RawText {
     [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false))
 }
 
+function Invoke-NativeQuietly {
+    param([string]$FilePath, [string[]]$ArgumentList)
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @ArgumentList *> $null
+        return $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference }
+}
+function Get-EnvMap {
+    param([string]$Path)
+    $values = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $values }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*([A-Z_]+)\s*=\s*(.*)$') { $values[$Matches[1]] = $Matches[2] }
+    }
+    return $values
+}
+
 function Read-PidFile {
     param([string]$Path)
     $value = 0
     try { if (Test-Path $Path) { [void][int]::TryParse((Get-Content $Path -Raw).Trim(), [ref]$value) } } catch { }
     return $value
+}
+
+function Stop-VerifiedProxyProcess {
+    param([int]$ProxyProcessId, [string]$ConfigPath, [string[]]$ExpectedExecutables)
+    if (-not $ProxyProcessId -or -not (Get-Process -Id $ProxyProcessId -ErrorAction SilentlyContinue)) { return }
+    $record = Get-CimInstance Win32_Process -Filter "ProcessId=$ProxyProcessId" -ErrorAction SilentlyContinue
+    if (-not $record -or -not $record.CommandLine) { Die "cannot verify ownership of stale proxy process $ProxyProcessId" }
+    $configPattern = '(?i)(?:^|\s)-config\s+(?:"' + [regex]::Escape($ConfigPath) + '"|' + [regex]::Escape($ConfigPath) + ')(?:\s|$)'
+    if ($record.CommandLine -notmatch $configPattern) { return }
+    $owned = $false
+    foreach ($expected in $ExpectedExecutables) {
+        if ($record.ExecutablePath -and $expected -and [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($record.ExecutablePath), [IO.Path]::GetFullPath($expected))) { $owned = $true; break }
+    }
+    if (-not $owned) { Die "stale process $ProxyProcessId uses the proxy config but is not an owned executable" }
+    Stop-Process -Id $ProxyProcessId -Force -ErrorAction Stop
+    Wait-Process -Id $ProxyProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    if (Get-Process -Id $ProxyProcessId -ErrorAction SilentlyContinue) { Die "could not stop owned stale proxy process $ProxyProcessId" }
+}
+
+function Find-QbraidPathReparsePoint {
+    param([string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    $current = $root
+    foreach ($segment in @($full.Substring($root.Length) -split '[\\/]' | Where-Object { $_ })) {
+        $current = Join-Path $current $segment
+        if (Test-Path $current) {
+            $item = Get-Item $current -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $item }
+        }
+    }
+    return $null
+}
+function Find-QbraidManagedReparsePoint {
+    param([string]$Path)
+    if (-not (Test-Path $Path -PathType Container)) { return $null }
+    $pending = New-Object Collections.Generic.Stack[string]
+    $pending.Push([IO.Path]::GetFullPath($Path))
+    while ($pending.Count -gt 0) {
+        foreach ($item in @(Get-ChildItem $pending.Pop() -Force -ErrorAction Stop)) {
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $item }
+            if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+        }
+    }
+    return $null
 }
 
 # ------------------------------------------------------ Claude compatibility
@@ -302,15 +369,41 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 }
 Say "Platform: windows/$($env:PROCESSOR_ARCHITECTURE.ToLower())"
 
-New-Item -ItemType Directory -Force -Path $HomeDir, $ProfilesDir, $BinDir, $ClaudeDir | Out-Null
 if ($PSBoundParameters.ContainsKey('Profile') -and -not $Profile) { Die 'invalid empty profile' }
 $InstallMutex = New-Object Threading.Mutex($false, "Local\qbraid-code-installer-$($env:USERNAME)")
 if (-not $InstallMutex.WaitOne(0)) { Die 'another qbraid-code installer is running.' }
-try { $InstallLockHandle = [IO.File]::Open((Join-Path $HomeDir '.install-lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-catch [IO.IOException] { Die 'another qbraid-code installer is running.' }
+$InstallLockHandle = $null
 $profileMutex = $null
 $updateHandle = $null
 try {
+$defaultHomeDir = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.qbraid-code')).TrimEnd('\')
+$normalizedHomeDir = [IO.Path]::GetFullPath($HomeDir).TrimEnd('\')
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($HomeDir.TrimEnd('\'), $normalizedHomeDir)) { Die 'install directory contains relative or dot segments.' }
+$pathReparsePoint = Find-QbraidPathReparsePoint $HomeDir
+if ($null -ne $pathReparsePoint) { Die "install directory uses reparse point '$($pathReparsePoint.FullName)'." }
+$managedReparsePoint = Find-QbraidManagedReparsePoint $HomeDir
+if ($null -ne $managedReparsePoint) { Die "install directory contains reparse point '$($managedReparsePoint.FullName)'." }
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($HomeDir.TrimEnd('\'), $defaultHomeDir) -and (Test-Path $HomeDir -PathType Container)) {
+    $existingMarker = Join-Path $HomeDir '.qbraid-code-install'
+    $markerOwned = (Test-Path $existingMarker -PathType Leaf) -and ((Get-Content $existingMarker -Raw -Encoding UTF8).Trim() -eq 'qbraid-code')
+    if (-not $markerOwned -and @(Get-ChildItem $HomeDir -Force -ErrorAction Stop).Count -gt 0) {
+        $sidecarPath = Join-Path $BinDir 'qbraid-code.home'
+        $sidecarBound = (Test-Path $sidecarPath -PathType Leaf) -and [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetFullPath((Get-Content $sidecarPath -Raw -Encoding UTF8).Trim()).TrimEnd('\'), $HomeDir.TrimEnd('\'))
+        $managedNames = @('profiles', 'secrets', 'ports', 'active-profile', 'global-profile', 'env', 'label', 'label-source', 'models.tsv', 'credits.cache', 'credits.updated', 'credits.attempt', 'organization-id', 'statusline.ps1', 'doctor.ps1', 'qbraid-proxy.ps1', 'cliproxyapi.exe', 'proxy-config.yaml', 'proxy-template.yaml', 'proxy.key', 'proxy-auth', 'proxy.pid', 'session-users', '.install-lock', '.coord-lock', '.update-lock')
+        $unexpected = @(Get-ChildItem $HomeDir -Force | Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or ($managedNames -notcontains $_.Name -and $_.Name -notlike 'runtime.*' -and $_.Name -notlike 'session.*' -and $_.Name -notlike '.qbraid-code-install.*.tmp') })
+        if (-not $sidecarBound -or $unexpected.Count -gt 0) {
+            Die "custom install directory '$HomeDir' is nonempty and not exclusively owned by qbraid-code. Choose an empty directory."
+        }
+    }
+}
+New-Item -ItemType Directory -Force -Path $HomeDir, $ProfilesDir, $BinDir, $ClaudeDir | Out-Null
+try { $InstallLockHandle = [IO.File]::Open((Join-Path $HomeDir '.install-lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+catch [IO.IOException] { Die 'another qbraid-code installer is running.' }
+Get-ChildItem $HomeDir -Force -File -Filter '.qbraid-code-install.*.tmp' -ErrorAction SilentlyContinue | Remove-Item -Force
+$markerTmp = Join-Path $HomeDir ('.qbraid-code-install.' + [guid]::NewGuid().ToString('N') + '.tmp')
+Write-RawText $markerTmp "qbraid-code`n"
+Move-Item $markerTmp (Join-Path $HomeDir '.qbraid-code-install') -Force
 if (-not $Profile) {
     $activePath = Join-Path $HomeDir 'active-profile'
     if (Test-Path $activePath) { $Profile = (Get-Content $activePath -Raw).Trim() }
@@ -319,12 +412,12 @@ if (-not $Profile) { $Profile = 'default' }
 if ($Profile -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$') { Die "invalid profile '$Profile'" }
 $ProfileRoot = Join-Path $ProfilesDir $Profile
 $ProfileDir = $ProfileRoot
-$legacyEnv = Join-Path $HomeDir 'env'
+$legacyEnvPath = Join-Path $HomeDir 'env'
 $defaultDir = Join-Path $ProfilesDir 'default'
-if ((Test-Path $legacyEnv) -and -not (Test-Path $defaultDir)) {
+if ((Test-Path $legacyEnvPath) -and -not (Test-Path $defaultDir)) {
     $migrationDir = Join-Path $ProfilesDir (".default.migrate.$PID.$([guid]::NewGuid().ToString('N'))")
     New-Item -ItemType Directory -Force -Path $migrationDir | Out-Null
-    $legacyLines = @(Get-Content $legacyEnv)
+    $legacyLines = @(Get-Content $legacyEnvPath)
     $legacyToken = ''
     $safeLines = @($legacyLines | Where-Object { if ($_ -match '^QBRAID_CODE_TOKEN=(.*)$') { $legacyToken = $Matches[1]; $false } else { $true } })
     if ($legacyToken) {
@@ -339,7 +432,7 @@ if ((Test-Path $legacyEnv) -and -not (Test-Path $defaultDir)) {
         $safeLines += "QBRAID_CODE_SECRET_REF=$secretRef"
     }
     Write-RawText (Join-Path $migrationDir 'env') (($safeLines -join "`n") + "`n")
-    foreach ($name in @('label','label-source','models.tsv','credits.cache','credits.updated','organization-id')) {
+    foreach ($name in @('label','label-source','models.tsv','credits.cache','credits.updated','credits.attempt','organization-id','proxy-template.yaml')) {
         $source = Join-Path $HomeDir $name
         if (Test-Path $source) { Copy-Item $source (Join-Path $migrationDir $name) -Recurse }
     }
@@ -349,13 +442,13 @@ if ((Test-Path $legacyEnv) -and -not (Test-Path $defaultDir)) {
 }
 function Remove-LegacyPlaintextToken {
     if (-not (Test-Path $defaultDir)) { return }
-    if (Test-Path $legacyEnv) {
-        $legacyLines = @(Get-Content $legacyEnv)
+    if (Test-Path $legacyEnvPath) {
+        $legacyLines = @(Get-Content $legacyEnvPath)
         if (@($legacyLines | Where-Object { $_ -match '^QBRAID_CODE_TOKEN=' }).Count -gt 0) {
             $lines = @($legacyLines | Where-Object { $_ -notmatch '^QBRAID_CODE_TOKEN=' })
-            $cleanEnv = "$legacyEnv.clean.$PID.$([guid]::NewGuid().ToString('N'))"
+            $cleanEnv = "$legacyEnvPath.clean.$PID.$([guid]::NewGuid().ToString('N'))"
             Write-RawText $cleanEnv (($lines -join "`n") + "`n")
-            Move-Item $cleanEnv $legacyEnv -Force
+            Move-Item $cleanEnv $legacyEnvPath -Force
         }
     }
     $legacyConfig = Join-Path $HomeDir 'proxy-config.yaml'
@@ -368,6 +461,9 @@ function Remove-LegacyPlaintextToken {
     }
     if (-not $keepConfig) { Remove-Item $legacyConfig -Force -ErrorAction SilentlyContinue }
 }
+if ($UpdateKey -and -not (Test-Path (Join-Path $ProfileRoot 'current')) -and -not (Test-Path (Join-Path $ProfileRoot 'env'))) {
+    Die "profile '$Profile' is not installed. Create it without -UpdateKey first."
+}
 New-Item -ItemType Directory -Force -Path $ProfileRoot | Out-Null
 $currentPath = Join-Path $ProfileRoot 'current'
 if (Test-Path $currentPath) {
@@ -377,6 +473,16 @@ if (Test-Path $currentPath) {
     if (-not (Test-Path (Join-Path $candidateProfile 'env'))) { Die "profile '$Profile' generation is incomplete" }
     $ProfileDir = $candidateProfile
 }
+$oldEnvPath = Join-Path $ProfileDir 'env'
+$oldModel = ''
+if (Test-Path $oldEnvPath) {
+    $oldModelLine = (Get-Content $oldEnvPath | Where-Object { $_ -like 'QBRAID_CODE_MODEL=*' } | Select-Object -First 1)
+    if ($oldModelLine) { $oldModel = $oldModelLine.Substring('QBRAID_CODE_MODEL='.Length) }
+}
+$oldLabelPath = Join-Path $ProfileDir 'label'
+$oldLabelSourcePath = Join-Path $ProfileDir 'label-source'
+$oldProfileLabel = if (Test-Path $oldLabelPath) { (Get-Content $oldLabelPath -Raw).Trim() } else { '' }
+$oldProfileLabelSource = if (Test-Path $oldLabelSourcePath) { (Get-Content $oldLabelSourcePath -Raw).Trim() } else { 'local' }
 foreach ($privateDir in @(Get-ChildItem $ProfilesDir -Directory -ErrorAction SilentlyContinue)) {
     try {
         $privateAcl = Get-Acl $privateDir.FullName
@@ -403,10 +509,10 @@ try {
 $stalePidPath = Join-Path $ProfileDir 'proxy.pid'
 if (Test-Path $stalePidPath) {
     $stalePid = Read-PidFile $stalePidPath
-    $staleProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$stalePid" -ErrorAction SilentlyContinue
-    if ($staleProcess -and $staleProcess.CommandLine -and $staleProcess.CommandLine.Contains((Join-Path $ProfileDir 'proxy-config.yaml'))) {
-        Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue
-    }
+    $oldProxySettings = Get-EnvMap (Join-Path $ProfileDir 'env')
+    $expectedProxyBinaries = @((Join-Path $HomeDir 'cliproxyapi.exe'))
+    if ($oldProxySettings['QBRAID_CODE_PROXY_BIN']) { $expectedProxyBinaries += $oldProxySettings['QBRAID_CODE_PROXY_BIN'] }
+    Stop-VerifiedProxyProcess $stalePid (Join-Path $ProfileDir 'proxy-config.yaml') $expectedProxyBinaries
     Remove-Item $stalePidPath -Force -ErrorAction SilentlyContinue
 }
 $ProxyPort = 8320
@@ -431,11 +537,11 @@ $globalProfilePath = Join-Path $HomeDir 'global-profile'
 if (Test-Path $Settings) {
     try {
         $legacySettings = Get-Content $Settings -Raw | ConvertFrom-Json
-        $legacyEnv = Get-Prop $legacySettings 'env'
-        $legacyBase = Get-Prop $legacyEnv 'ANTHROPIC_BASE_URL'
+        $legacyClaudeEnv = Get-Prop $legacySettings 'env'
+        $legacyBase = Get-Prop $legacyClaudeEnv 'ANTHROPIC_BASE_URL'
         if ($legacyBase -like '*api-v2.qbraid.com*') {
             foreach ($key in @('ANTHROPIC_BASE_URL','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_SMALL_FAST_MODEL','QBRAID_CODE_PROFILE','QBRAID_CODE_HOME')) {
-                $legacyEnv.PSObject.Properties.Remove($key)
+                $legacyClaudeEnv.PSObject.Properties.Remove($key)
             }
             Write-RawText $Settings ($legacySettings | ConvertTo-Json -Depth 20)
             Warn 'removed unsafe legacy plain-Claude gateway settings; use qbraid-code'
@@ -499,6 +605,23 @@ function Set-ProfileSecret {
     } catch { Die 'could not store the profile key in Windows Credential Locker' }
 }
 
+function Remove-CredentialLockerItem {
+    param([string]$Reference)
+    $vault = New-Object Windows.Security.Credentials.PasswordVault
+    try { $credential = $vault.Retrieve($Reference, $env:USERNAME) }
+    catch {
+        if ($_.Exception.HResult -eq -2147023728) { return }
+        throw
+    }
+    $vault.Remove($credential)
+    try {
+        $remaining = $vault.Retrieve($Reference, $env:USERNAME)
+        if ($remaining) { throw "Credential Locker item '$Reference' remains after removal" }
+    } catch {
+        if ($_.Exception.HResult -ne -2147023728) { throw }
+    }
+}
+
 function Remove-OldProfileGenerations {
     param([string]$CurrentGeneration)
     $generationsPath = Join-Path $ProfileRoot 'generations'
@@ -507,18 +630,21 @@ function Remove-OldProfileGenerations {
         $flatSettings = Get-EnvMap $flatEnv
         $flatRef = $flatSettings['QBRAID_CODE_SECRET_REF']
         if ($flatSettings['QBRAID_CODE_SECRET_BACKEND'] -eq 'credential-locker' -and $flatRef -eq "qbraid-code:$Profile") {
-            try { $flatVault = New-Object Windows.Security.Credentials.PasswordVault; $flatCredential = $flatVault.Retrieve($flatRef, $env:USERNAME); $flatVault.Remove($flatCredential) } catch { }
+            Remove-CredentialLockerItem $flatRef
+        } elseif ($flatRef) { throw 'cannot safely prune an unknown flat-profile credential' }
+        foreach ($flatName in @('env','proxy-template.yaml','label','label-source','models.tsv','credits.cache','credits.updated','organization-id')) {
+            $flatPath = Join-Path $ProfileRoot $flatName
+            if (Test-Path $flatPath) { Remove-Item $flatPath -Force -ErrorAction Stop }
         }
-        foreach ($flatName in @('env','proxy-template.yaml','label','label-source','models.tsv','credits.cache','credits.updated','organization-id')) { Remove-Item (Join-Path $ProfileRoot $flatName) -Force -ErrorAction SilentlyContinue }
     }
     Get-ChildItem $generationsPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         if ($_.Name -eq $CurrentGeneration -or $_.Name.StartsWith('.stage.')) { return }
         $oldSettings = Get-EnvMap (Join-Path $_.FullName 'env')
         $oldRef = $oldSettings['QBRAID_CODE_SECRET_REF']
         if ($oldSettings['QBRAID_CODE_SECRET_BACKEND'] -eq 'credential-locker' -and $oldRef -and $oldRef.StartsWith("qbraid-code:${Profile}:")) {
-            try { $oldVault = New-Object Windows.Security.Credentials.PasswordVault; $oldCredential = $oldVault.Retrieve($oldRef, $env:USERNAME); $oldVault.Remove($oldCredential) } catch { }
-        }
-        Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-CredentialLockerItem $oldRef
+        } elseif ($oldRef) { throw "cannot safely prune credential metadata in $($_.FullName)" }
+        Remove-Item $_.FullName -Recurse -Force -ErrorAction Stop
     }
 }
 
@@ -526,9 +652,9 @@ Say 'qBraid account'
 $ApiKey    = $env:QBRAID_API_KEY
 $Balance   = $null
 $KeySource = 'QBRAID_API_KEY'
-if (-not $ApiKey) { $ApiKey = Get-ProfileSecret; if ($ApiKey) { $KeySource = 'profile secret store' } }
+if (-not $ApiKey -and -not $UpdateKey) { $ApiKey = Get-ProfileSecret; if ($ApiKey) { $KeySource = 'profile secret store' } }
 
-if (-not $ApiKey) {
+if (-not $ApiKey -and -not $UpdateKey) {
     $candidate = Read-QbraidrcKey
     if ($candidate) {
         $Balance = Get-Balance $candidate
@@ -608,14 +734,16 @@ if (-not (Confirm-Step 'Is this the right organization?' 'y')) {
     exit 1
 }
 Ok 'organization confirmed'
-$orgIdPath = Join-Path $ProfileDir 'organization-id'
-$oldOrgId = if (Test-Path $orgIdPath) { (Get-Content $orgIdPath -Raw).Trim() } else { '' }
+$oldOrgIdPath = Join-Path $ProfileDir 'organization-id'
+$oldOrgId = if (Test-Path $oldOrgIdPath) { (Get-Content $oldOrgIdPath -Raw).Trim() } else { '' }
+if ($UpdateKey -and -not $oldOrgId) { Die "profile '$Profile' has no verified organization ID. Create a new profile for the replacement key." }
 if ($oldOrgId -and (-not $OrgId -or $oldOrgId -ne $OrgId)) { Die "profile '$Profile' belongs to another organization. Use a new profile name." }
 
 # ------------------------------------------------------------- 5. model choice
 
 Say 'Model'
 $Model = $env:QBRAID_CODE_MODEL
+if ($UpdateKey -and -not $Model) { $Model = $oldModel }
 if (-not $Model) {
     $ids = @()
     try {
@@ -669,13 +797,13 @@ $envLines = @(
 $envPath = Join-Path $ProfileDir 'env'
 Remove-Item (Join-Path $ProfileDir 'proxy-config.yaml'), (Join-Path $ProfileDir 'proxy-template.yaml'), (Join-Path $ProfileDir 'proxy.key'), (Join-Path $ProfileDir 'proxy-auth') -Recurse -Force -ErrorAction SilentlyContinue
 Write-RawText $envPath (($envLines -join "`n") + "`n")
-$ProfileLabel = if ($env:QBRAID_CODE_PROFILE_LABEL) { $env:QBRAID_CODE_PROFILE_LABEL } elseif ($OrgName) { $OrgName } else { $Profile }
-$ProfileLabelSource = if ($env:QBRAID_CODE_PROFILE_LABEL) { 'local' } elseif ($OrgName) { 'verified' } else { 'local' }
+$ProfileLabel = if ($env:QBRAID_CODE_PROFILE_LABEL) { $env:QBRAID_CODE_PROFILE_LABEL } elseif ($UpdateKey -and $oldProfileLabel) { $oldProfileLabel } elseif ($OrgName) { $OrgName } else { $Profile }
+$ProfileLabelSource = if ($env:QBRAID_CODE_PROFILE_LABEL) { 'local' } elseif ($UpdateKey -and $oldProfileLabel) { $oldProfileLabelSource } elseif ($OrgName) { 'verified' } else { 'local' }
 $ProfileLabel = ($ProfileLabel -replace '[\x00-\x1F\x7F]', '')
 if (-not $ProfileLabel -or $ProfileLabel.Length -gt 40) { $ProfileLabel = $Profile; $ProfileLabelSource = 'local' }
 Write-RawText (Join-Path $ProfileDir 'label') "$ProfileLabel`n"
 Write-RawText (Join-Path $ProfileDir 'label-source') "$ProfileLabelSource`n"
-if ($OrgId) { Write-RawText $orgIdPath "$OrgId`n" }
+if ($OrgId) { Write-RawText (Join-Path $ProfileDir 'organization-id') "$OrgId`n" }
 $modelFacts = @(
     "claude-haiku-4-5`t200000",
     "claude-opus-4-8`t1000000",
@@ -709,32 +837,35 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'qbraid-code.cmd'))) 
 # on a .cmd makes cmd.exe fail to parse its first line. Write bytes directly.
 function Fetch-File {
     param([string]$Name, [string]$Dest)
-    if ($SrcDir) {
-        $source = Join-Path $SrcDir $Name
-        if ($Dest.EndsWith('.cmd')) { Write-RawText $Dest ([IO.File]::ReadAllText($source)) } else { Copy-Item $source $Dest -Force }
-        return
-    }
-
-    # qbraid.com first: that is the point of the proxy, on networks where
-    # raw.githubusercontent.com is blocked but qbraid.com is not.
-    foreach ($base in @($SiteBase, $RawBase)) {
-        try {
-            $r = Invoke-WebRequest -Uri "$base/$Name" -TimeoutSec 30 -UseBasicParsing
-            if ($r.StatusCode -eq 200 -and $r.Content) {
-                Write-RawText $Dest $r.Content
-                return
+    $temp = "$Dest.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $content = $null
+        if ($SrcDir) {
+            $content = [IO.File]::ReadAllText((Join-Path $SrcDir $Name))
+        } else {
+            foreach ($base in @($SiteBase, $RawBase)) {
+                try {
+                    $response = Invoke-WebRequest -Uri "$base/$Name" -TimeoutSec 30 -UseBasicParsing
+                    if ($response.StatusCode -eq 200 -and $response.Content) { $content = $response.Content; break }
+                } catch { }
             }
-        } catch { }
+            if (-not $content) {
+                if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+                    Die "could not download $Name from qbraid.com or GitHub. Check your connection and re-run."
+                }
+                $content = (gh api -H 'Accept: application/vnd.github.raw' "$GhContents/$Name" | Out-String)
+                if ($LASTEXITCODE -ne 0 -or -not $content) {
+                    Die "could not download $Name - is ``gh auth login`` done, and are you in the qBraid org?"
+                }
+            }
+        }
+        if (-not $content) { Die "downloaded $Name but it is empty." }
+        if ($Dest.EndsWith('.cmd')) { $content = ($content -replace "`r`n", "`n") -replace "`n", "`r`n" }
+        [IO.File]::WriteAllText($temp, $content, (New-Object Text.UTF8Encoding $false))
+        Move-Item $temp $Dest -Force -ErrorAction Stop
+    } finally {
+        if (Test-Path $temp) { Remove-Item $temp -Force -ErrorAction SilentlyContinue }
     }
-
-    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        Die "could not download $Name from qbraid.com or GitHub. Check your connection and re-run."
-    }
-    $text = (gh api -H 'Accept: application/vnd.github.raw' "$GhContents/$Name" | Out-String)
-    if ($LASTEXITCODE -ne 0 -or -not $text) {
-        Die "could not download $Name - is ``gh auth login`` done, and are you in the qBraid org?"
-    }
-    Write-RawText $Dest $text
 }
 
 $ProxyHelperPath = Join-Path $HomeDir 'qbraid-proxy.ps1'
@@ -743,7 +874,12 @@ $LaunchHelperPath = Join-Path $BinDir 'qbraid-launch.ps1'
 $StatuslinePath = Join-Path $HomeDir 'statusline.ps1'
 $DoctorPath     = Join-Path $HomeDir 'doctor.ps1'
 Fetch-File 'qbraid-code.cmd' $LauncherPath
-Write-RawText (Join-Path $BinDir 'qbraid-code.home') $HomeDir
+$sidecarPath = Join-Path $BinDir 'qbraid-code.home'
+$sidecarTemp = "$sidecarPath.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+try {
+    Write-RawText $sidecarTemp $HomeDir
+    Move-Item $sidecarTemp $sidecarPath -Force -ErrorAction Stop
+} finally { Remove-Item $sidecarTemp -Force -ErrorAction SilentlyContinue }
 Fetch-File 'qbraid-launch.ps1' $LaunchHelperPath
 Ok "launcher installed to $LauncherPath"
 Fetch-File 'statusline.ps1' $StatuslinePath
@@ -858,18 +994,6 @@ if ($ProxyBin) {
 
 # Appended after the env file exists.
 Add-Content -Path $envPath -Value @("QBRAID_CODE_PROXY_PORT=$ProxyPort", "QBRAID_CODE_PROXY_BIN=$ProxyBin")
-$finalGeneration = Join-Path $generationsDir $generation
-Move-Item $ProfileStage $finalGeneration
-$ProfileStage = $null
-$currentTmp = Join-Path $ProfileRoot ("current.$PID.tmp")
-Write-RawText $currentTmp "$generation`n"
-Move-Item $currentTmp $currentPath -Force
-$SecretStaged = $false
-$ProfileDir = $finalGeneration
-Remove-OldProfileGenerations $generation
-Remove-LegacyPlaintextToken
-Ok "profile '$Profile' metadata committed"
-
 # --------------------------------------------------------- 8. first-run flags
 
 Say 'Claude Code first run'
@@ -906,15 +1030,14 @@ Ok "statusline enabled in $Settings"
 Say 'qBraid MCP'
 $mcpRegistered = $false
 if ($script:ClaudeMcpGet) {
-    claude mcp get $McpName *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if ((Invoke-NativeQuietly 'claude' @('mcp', 'get', $McpName)) -eq 0) {
         $mcpRegistered = $true
         Ok 'already registered'
     }
 }
 if (-not $mcpRegistered -and (Test-ClaudeRequiredCapabilities)) {
-    claude mcp add --transport http $McpName $McpUrl --scope user *> $null
-    if ($LASTEXITCODE -ne 0) { Die 'could not register the qBraid MCP server.' }
+    $mcpAddExitCode = Invoke-NativeQuietly 'claude' @('mcp', 'add', '--transport', 'http', $McpName, $McpUrl, '--scope', 'user')
+    if ($mcpAddExitCode -ne 0) { Die 'could not register the qBraid MCP server.' }
     $mcpRegistered = $true
     Ok "registered $McpUrl"
 } elseif (-not $mcpRegistered) {
@@ -933,8 +1056,14 @@ if (-not $mcpRegistered) {
 } elseif (Confirm-Step 'Sign in to the qBraid MCP now? (opens a browser)' 'y') {
     # Unlike the piped bash path, `iex` keeps the console attached, so the
     # OAuth prompt can read the redirect URL directly.
-    claude mcp login $McpName
-    if ($LASTEXITCODE -ne 0) { Warn "MCP sign-in did not complete. Run ``claude mcp login $McpName`` later." }
+    $savedPreference = $ErrorActionPreference
+    $mcpLoginExitCode = 1
+    try {
+        $ErrorActionPreference = 'Continue'
+        claude mcp login $McpName
+        $mcpLoginExitCode = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference }
+    if ($mcpLoginExitCode -ne 0) { Warn "MCP sign-in did not complete. Run ``claude mcp login $McpName`` later." }
 } else {
     Warn "skipped. Run ``claude mcp login $McpName`` when you want the qBraid tools."
 }
@@ -968,10 +1097,35 @@ try {
 
 # ---------------------------------------------------------------- 12. finish
 
+$finalGeneration = Join-Path $generationsDir $generation
+Move-Item $ProfileStage $finalGeneration -ErrorAction Stop
+$ProfileStage = $finalGeneration
+$currentTmp = Join-Path $ProfileRoot ("current.$PID.tmp")
+try {
+    Write-RawText $currentTmp "$generation`n"
+    Move-Item $currentTmp $currentPath -Force -ErrorAction Stop
+} catch {
+    Remove-Item $currentTmp -Force -ErrorAction SilentlyContinue
+    throw
+}
+$ProfileStage = $null
+$SecretStaged = $false
+$ProfileDir = $finalGeneration
+try { Remove-OldProfileGenerations $generation } catch { Warn 'could not prune every retired profile generation.' }
+try { Remove-LegacyPlaintextToken } catch { Warn 'could not remove every legacy credential artifact.' }
+Ok "profile '$Profile' metadata committed"
+
+if (-not $UpdateKey) {
+    $activeTmp = Join-Path $HomeDir ("active-profile.$PID.$([guid]::NewGuid().ToString('N')).tmp")
+    try {
+        Write-RawText $activeTmp "$Profile`n"
+        Move-Item $activeTmp (Join-Path $HomeDir 'active-profile') -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $activeTmp -Force -ErrorAction SilentlyContinue
+        Warn "could not select '$Profile' for future sessions. Run qbraid-code --use-profile $Profile."
+    }
+}
 Write-Host ''
-$activeTmp = Join-Path $HomeDir ("active-profile.$PID.$([guid]::NewGuid().ToString('N')).tmp")
-Write-RawText $activeTmp "$Profile`n"
-Move-Item $activeTmp (Join-Path $HomeDir 'active-profile') -Force
 Write-Host 'qbraid-code is ready.' -ForegroundColor Green
 Write-Host ''
 Write-Host '  Open a new terminal, then run it from any folder:'
@@ -984,6 +1138,12 @@ Write-Host '  Your own claude command is untouched.'
 Write-Host ''
 
 } finally {
+    $stageCommitted = $false
+    if ($ProfileStage -and (Test-Path (Join-Path $ProfileRoot 'current'))) {
+        $selectedGeneration = (Get-Content (Join-Path $ProfileRoot 'current') -Raw -ErrorAction SilentlyContinue).Trim()
+        $stageCommitted = $selectedGeneration -and $selectedGeneration -eq (Split-Path $ProfileStage -Leaf) -and (Test-Path (Join-Path $ProfileStage 'env'))
+    }
+    if ($stageCommitted) { $SecretStaged = $false; $ProfileStage = $null }
     if ($SecretStaged -and $SecretRef) {
         try { $vault = New-Object Windows.Security.Credentials.PasswordVault; $orphan = $vault.Retrieve($SecretRef, $env:USERNAME); $vault.Remove($orphan) } catch { }
     }
