@@ -129,7 +129,11 @@ if (-not $claudePresent -or -not $mcpGet) {
             Write-Host 'mcp:      registered (run /mcp inside Claude Code to authenticate)'
         }
     } else {
-        Write-Host 'mcp:      NOT REGISTERED'
+        if ($mcpLogin) {
+            Write-Host 'mcp:      NOT REGISTERED - re-run the installer'
+        } else {
+            Write-Host 'mcp:      NOT REGISTERED - configure and authenticate through /mcp'
+        }
     }
 }
 

@@ -208,6 +208,13 @@ function Confirm-ClaudeCompatibility {
             } else {
                 Die "Claude Code $($script:ClaudeVersion) is newer than tested and lacks required capabilities. Refusing to downgrade it; set QBRAID_CODE_CLAUDE_POLICY=continue to skip unavailable features."
             }
+        } elseif ($script:ClaudeVersionStatus -eq 'unknown') {
+            if ($action -in @('continue', 'prompt')) {
+                Warn "Claude Code's version is unknown; refusing to replace it with stable because that could downgrade it, and continuing with reduced compatibility."
+                $action = 'handled'
+            } else {
+                Die "Claude Code's version is unknown. Refusing to replace it with stable because that could downgrade it; update Claude Code manually or set QBRAID_CODE_CLAUDE_POLICY=continue."
+            }
         }
         if ($action -eq 'upgrade') {
             Warn "the installed Claude Code is incompatible: $issue"
@@ -647,20 +654,21 @@ if ($Global) {
 
 Say 'qBraid MCP'
 $mcpRegistered = $false
-if (-not (Test-ClaudeRequiredCapabilities)) {
-    Warn 'this Claude Code version cannot register an HTTP MCP server from the command line.'
-    Warn "Start Claude Code, run /mcp, and add $McpUrl manually; or upgrade Claude Code."
-} else {
+if ($script:ClaudeMcpGet) {
     claude mcp get $McpName *> $null
+    if ($LASTEXITCODE -eq 0) {
+        $mcpRegistered = $true
+        Ok 'already registered'
+    }
 }
-if ((Test-ClaudeRequiredCapabilities) -and $LASTEXITCODE -eq 0) {
-    $mcpRegistered = $true
-    Ok 'already registered'
-} elseif (Test-ClaudeRequiredCapabilities) {
+if (-not $mcpRegistered -and (Test-ClaudeRequiredCapabilities)) {
     claude mcp add --transport http $McpName $McpUrl --scope user *> $null
     if ($LASTEXITCODE -ne 0) { Die 'could not register the qBraid MCP server.' }
     $mcpRegistered = $true
     Ok "registered $McpUrl"
+} elseif (-not $mcpRegistered) {
+    Warn 'this Claude Code version cannot register an HTTP MCP server from the command line.'
+    Warn "Start Claude Code, run /mcp, and add $McpUrl manually; or upgrade Claude Code."
 }
 
 # The MCP endpoint is JWT-only (OAuth + dynamic client registration): the API

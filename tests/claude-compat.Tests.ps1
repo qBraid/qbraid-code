@@ -151,6 +151,21 @@ Confirm-ClaudeCompatibility
 Assert-Equal 'prompt never downgrades a newer CLI' `
     ($script:Messages -join "`n" -match 'refusing to downgrade') $true
 
+$env:QBRAID_CODE_CLAUDE_POLICY = 'upgrade'
+$script:FakeClaudeVersion = 'mystery-version'
+$script:FakeUserScope = $true
+$unknownRefused = $false
+try { Confirm-ClaudeCompatibility } catch { $unknownRefused = $_.Exception.Message -match 'could downgrade' }
+Assert-Equal 'upgrade never replaces an unknown version' $unknownRefused $true
+Assert-Equal 'unknown version remains installed' $script:FakeClaudeVersion 'mystery-version'
+
+$env:QBRAID_CODE_CLAUDE_POLICY = 'prompt'
+$script:Interactive = $true
+$script:Messages = @()
+Confirm-ClaudeCompatibility
+Assert-Equal 'prompt never replaces an unknown version' `
+    ($script:Messages -join "`n" -match 'could downgrade') $true
+
 Remove-Item Env:\QBRAID_CODE_CLAUDE_POLICY
 Remove-Item Function:\claude
 

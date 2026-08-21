@@ -35,18 +35,21 @@ Re-running it is safe.
 ### Claude Code compatibility
 
 qbraid-code currently supports Claude Code **2.1.186 or newer** and is tested
-through **2.1.238**. A newer version is never blocked or downgraded; the
-installer only notes that it is newer than the latest version covered by CI.
+through **2.1.238**. A newer version is never automatically downgraded. It is
+allowed by default, but `fail` and `upgrade` stop rather than replacing it if
+required capabilities have disappeared; `prompt` and `continue` keep it and
+skip unavailable features.
 
 If an existing Claude Code is too old or is missing the HTTP MCP commands that
 qbraid-code needs, the installer offers to move it to Anthropic's `stable`
-channel. It always asks before changing an existing installation. Set
-`QBRAID_CODE_CLAUDE_POLICY` to choose the behavior explicitly:
+channel. The default `prompt` policy asks before changing an existing
+installation; `upgrade` explicitly opts into doing that without a prompt. Set
+`QBRAID_CODE_CLAUDE_POLICY` to choose the behavior:
 
 | Value | Behavior |
 |---|---|
 | `prompt` | Ask before installing or upgrading (default with a terminal) |
-| `upgrade` | Install or upgrade to the stable channel without prompting |
+| `upgrade` | Install or upgrade to stable without prompting, but never downgrade a newer or unknown version |
 | `fail` | Stop rather than changing Claude Code (default without a terminal) |
 | `continue` | Keep an unsupported version and skip or degrade unavailable features |
 

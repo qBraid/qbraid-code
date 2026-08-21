@@ -241,7 +241,11 @@ case "${1:-}" in
         echo "mcp:      registered (run /mcp inside Claude Code to authenticate)"
       fi
     else
-      echo "mcp:      NOT REGISTERED"
+      if [ "$MCP_LOGIN" = yes ]; then
+        echo "mcp:      NOT REGISTERED — re-run the installer"
+      else
+        echo "mcp:      NOT REGISTERED — configure and authenticate through /mcp"
+      fi
     fi
 
     echo "model:    ${MODEL:-not set}"

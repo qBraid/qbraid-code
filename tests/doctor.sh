@@ -28,7 +28,7 @@ case "${1:-} ${2:-}" in
       '  --transport <transport>  stdio, sse, or http' \
       '  --scope <scope>          local, project, or user'
     ;;
-  "mcp get") [ "${3:-}" = qbraid ] ;;
+  "mcp get") [ "${3:-}" = qbraid ] && [ "${FAKE_MCP_REGISTERED:-yes}" = yes ] ;;
 esac
 EOF
 chmod +x "$tmp/bin/claude"
@@ -49,6 +49,11 @@ check_contains "doctor rejects old version" "$old" \
 check_contains "doctor reports missing login capability" "$old" "mcp-login=no"
 check_contains "doctor gives interactive MCP fallback" "$old" \
   "registered (run /mcp inside Claude Code to authenticate)"
+
+unregistered=$(HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+  FAKE_MCP_REGISTERED=no ./qbraid-code --doctor)
+check_contains "doctor gives fallback when MCP is unregistered" "$unregistered" \
+  "NOT REGISTERED — configure and authenticate through /mcp"
 
 new=$(HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
   FAKE_CLAUDE_VERSION=2.1.239 FAKE_MCP_LOGIN=yes ./qbraid-code --doctor)

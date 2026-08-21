@@ -243,17 +243,22 @@ ensure_claude_compatible() {
 
   if [ -n "$issue" ]; then
     action=$(claude_policy_action "$policy" "$interactive")
-    if [ "$CLAUDE_VERSION_STATUS" = newer-than-tested ]; then
-      case "$action" in
-        continue|prompt)
-          warn "Claude Code $CLAUDE_VERSION is newer than tested and lacks required capabilities; refusing to downgrade it and continuing with reduced compatibility."
-          ;;
-        *)
-          die "Claude Code $CLAUDE_VERSION is newer than tested and lacks required capabilities. Refusing to downgrade it; set QBRAID_CODE_CLAUDE_POLICY=continue to skip unavailable features."
-          ;;
-      esac
-      action=handled
-    fi
+    case "$CLAUDE_VERSION_STATUS" in
+      newer-than-tested)
+        case "$action" in
+          continue|prompt) warn "Claude Code $CLAUDE_VERSION is newer than tested and lacks required capabilities; refusing to downgrade it and continuing with reduced compatibility." ;;
+          *) die "Claude Code $CLAUDE_VERSION is newer than tested and lacks required capabilities. Refusing to downgrade it; set QBRAID_CODE_CLAUDE_POLICY=continue to skip unavailable features." ;;
+        esac
+        action=handled
+        ;;
+      unknown)
+        case "$action" in
+          continue|prompt) warn "Claude Code's version is unknown; refusing to replace it with stable because that could downgrade it, and continuing with reduced compatibility." ;;
+          *) die "Claude Code's version is unknown. Refusing to replace it with stable because that could downgrade it; update Claude Code manually or set QBRAID_CODE_CLAUDE_POLICY=continue." ;;
+        esac
+        action=handled
+        ;;
+    esac
     case "$action" in
       upgrade)
         warn "the installed Claude Code is incompatible: $issue"
@@ -873,17 +878,17 @@ fi
 
 say "qBraid MCP"
 MCP_REGISTERED=0
-if ! claude_required_capabilities_present; then
-  warn "this Claude Code version cannot register an HTTP MCP server from the command line."
-  warn "Start Claude Code, run /mcp, and add $MCP_URL manually; or upgrade Claude Code."
-elif claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
+if [ "$CLAUDE_MCP_GET" = 1 ] && claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
   MCP_REGISTERED=1
   ok "already registered"
-else
+elif claude_required_capabilities_present; then
   claude mcp add --transport http "$MCP_NAME" "$MCP_URL" --scope user >/dev/null \
     || die "could not register the qBraid MCP server."
   MCP_REGISTERED=1
   ok "registered $MCP_URL"
+else
+  warn "this Claude Code version cannot register an HTTP MCP server from the command line."
+  warn "Start Claude Code, run /mcp, and add $MCP_URL manually; or upgrade Claude Code."
 fi
 
 # The MCP endpoint is JWT-only (OAuth + dynamic client registration): the API

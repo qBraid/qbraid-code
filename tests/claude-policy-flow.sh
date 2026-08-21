@@ -88,6 +88,10 @@ run_case "upgrade never downgrades a newer CLI" upgrade no 1 \
   "Refusing to downgrade it" no 2.1.239
 run_case "prompt never downgrades a newer CLI" prompt yes 0 \
   "refusing to downgrade it and continuing" no 2.1.239
+run_case "upgrade never replaces an unknown version" upgrade no 1 \
+  "could downgrade it" yes mystery-version
+run_case "prompt never replaces an unknown version" prompt yes 0 \
+  "could downgrade it" yes mystery-version
 
 printf '2.1.179' > "$state"
 rc=0

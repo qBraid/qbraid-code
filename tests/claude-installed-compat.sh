@@ -6,12 +6,18 @@ version=$(claude --version)
 printf 'claude: %s\n' "$version"
 
 help=$(claude mcp --help)
-for command in add get login; do
+for command in add get; do
   printf '%s\n' "$help" | grep -Eq "^[[:space:]]+$command([[:space:]]|$)" || {
     printf 'missing required mcp command: %s\n' "$command" >&2
     exit 1
   }
 done
+
+if printf '%s\n' "$help" | grep -Eq '^[[:space:]]+login([[:space:]]|$)'; then
+  printf 'mcp login: available\n'
+else
+  printf 'mcp login: unavailable; interactive /mcp fallback required\n'
+fi
 
 add_help=$(claude mcp add --help)
 printf '%s\n' "$add_help" | grep -Eq -- '--transport.*http' || {
