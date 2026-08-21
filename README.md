@@ -1,10 +1,9 @@
 # qbraid-code
 
-Claude Code, powered by the **qBraid AI gateway**. One command installs everything
-and leaves you in a working session: Claude Code itself, your qBraid credentials,
-a live credit statusline, and the qBraid MCP tools.
+Claude Code, powered by the **qBraid AI gateway**.
 
-Your own `claude` command stays untouched unless you ask for `--global`.
+The installer adds Claude Code, qBraid API-key profiles, a credit statusline,
+GPT translation, and the qBraid MCP. It needs no Node.js or administrator rights.
 
 ## Install
 
@@ -14,105 +13,140 @@ Your own `claude` command stays untouched unless you ask for `--global`.
 curl -fsSL https://qbraid.com/code.sh | bash
 ```
 
-**Windows** (PowerShell)
+**Windows PowerShell**
 
 ```powershell
 irm https://qbraid.com/code.ps1 | iex
 ```
 
-That is all. The installer:
-
-- installs **Claude Code** if you do not have it — a native binary, no Node.js and no administrator rights
-- finds your **qBraid API key**, or opens the page where you can copy one
-- shows you which **organization** the key belongs to and asks you to confirm it
-- lets you **choose a default model** from the list the gateway is actually serving
-- registers the **qBraid MCP** and signs you in
-- installs a **statusline** showing your remaining qBraid credits
-- runs a **real request** to prove it works before it says "ready"
-
-Re-running it is safe.
-
-## Use
+The first install creates the `default` profile. Add a named profile with the
+same installer.
 
 ```bash
-qbraid-code                      # start a session
-qbraid-code -p "explain this"    # ask one question and exit
-qbraid-code --doctor             # check your setup
+curl -fsSL https://qbraid.com/code.sh | bash -s -- --profile research
 ```
 
-Every other flag goes straight through to `claude`, so `-c`, `--model`,
-`--allowedTools` and the rest behave normally.
+```powershell
+& ([scriptblock]::Create((irm https://qbraid.com/code.ps1))) -Profile research
+```
+
+Set `QBRAID_CODE_PROFILE_LABEL` to show a different readable label. The
+installer uses an authenticated organization name when the API returns one.
+Otherwise it marks this label as local and adds a shortened verified
+organization-ID tag.
+
+Existing singleton installs migrate to `profiles/default` once. Migration does
+not overwrite an existing profile. The old files remain available to sessions
+that were already running.
+
+## Use profiles
+
+```bash
+qbraid-code                           # use the active profile
+qbraid-code --profile research       # bind this session to research
+qbraid-code --profiles               # list profiles
+qbraid-code --use-profile research   # select future sessions
+qbraid-code --doctor                 # check the bound profile
+```
+
+`--profile` must be the first option. The launcher removes it before forwarding
+the remaining arguments to Claude Code.
+
+Each launch resolves one immutable metadata generation. Profile updates stage a
+complete generation and atomically switch `current`. Failed updates leave the
+previous generation and secret reference intact.
+
+macOS stores keys in Keychain. Windows stores them in Credential Locker. Linux
+uses Secret Service through `secret-tool` when available. Headless Linux falls
+back to a documented private `0600` file.
+Claude receives only a random per-launch loopback token. The status snapshot
+contains no API key.
+
+A profile slug belongs to one organization. Use a new slug when a key belongs
+to another organization. Existing sessions stay pinned to their generation.
+
+Every resume requires `--allow-profile-resume`. Confirm the intended account
+with `--profile NAME --allow-profile-resume --resume ...`.
+
+The launcher excludes project and local Claude settings. Their hooks can read
+process credentials or replace the gateway. User settings still load. Gateway
+credentials are pinned through higher-precedence CLI settings.
+
+The statusline renders the account beside its balance.
+
+```text
+qbraid-code ⎇ main │ Claude Opus 5 │ C13 █░░░░░ │ qBraid Research Lab · 4281 credits
+```
+
+The `qBraid` word uses the qBraid violet accent. Warning and low-credit colors
+remain semantic.
+Unverified profile labels include `(local)`. Their account segment also includes
+a shortened verified organization ID. Credit snapshots show `stale` after five
+minutes without a successful launch refresh.
 
 ### GPT models
-
-The gateway also serves OpenAI GPT models, and `qbraid-code` can use them:
 
 ```bash
 qbraid-code --model gpt-5.6-sol
 qbraid-code --model gpt-5.4-mini -p "explain this error"
 ```
 
-Every model — Claude and GPT — is served through one local endpoint: a small
-translation proxy (CLIProxyAPI, loopback only, started on demand). Claude
-models pass through to the gateway untouched; GPT models are translated to its
-OpenAI-compatible surface. Because it is one endpoint, `/model <name>` works
-for **any** of the models mid-session, e.g. `/model gpt-5.6-sol`.
+CLIProxyAPI runs on loopback only. Claude models pass through unchanged. GPT
+models use the gateway OpenAI-compatible surface. Each launch owns a random
+local bearer, runtime port, and proxy process. The proxy stops with the session.
+Its private runtime config is removed during launch cleanup.
 
-If the proxy is missing, Claude models automatically fall back to the gateway
-directly — they can never break because of it. It shuts down by itself when
-you quit the session that started it; `qbraid-code --stop` stops it by hand.
+GPT models accept at most 128 tools. Use `--strict-mcp-config` when many MCP
+servers would exceed that limit.
 
-One caveat: GPT models accept at most 128 tools, so with many MCP servers add
-`--strict-mcp-config`.
+### Context windows
 
-A session looks like this:
+The installer stores exact model IDs and context limits in each profile's
+`models.tsv`. Verified built-in fallbacks cover Sol, Opus, Haiku, and the
+GPT-5.4 family. Unknown models stay at the conservative 200,000-token policy.
 
-```
-qbraid-code ⎇ main │ Claude Opus 5 │ C13 █░░░░░ │ 4281 credits
-```
+One-million-token models use Claude Code's `[1m]` model marker. Sol's
+1,050,000-token window is advertised conservatively as 1,000,000 tokens.
+Other gateway models use `CLAUDE_CODE_MAX_CONTEXT_TOKENS` with their catalog
+value.
 
-Folder and branch, the model you are talking to, how much of the context window
-is used, and what you have left to spend.
+Context policy belongs to the Claude Code process. Gateway picker discovery is
+disabled because its rows can mix incompatible context classes. Relaunch with
+`--model` to change models. This keeps accounting accurate.
 
-### Take over the plain `claude` command
+### Thinking
 
-If qBraid is the only backend you use, install with `--global` and plain `claude`
-will use it too:
+Claude Code sends adaptive thinking, display policy, and effort for current
+Opus models. qbraid-api must preserve those fields at the Bedrock boundary.
+Deploy the coordinated qbraid-api adaptive-thinking fix before this version.
 
-```bash
-curl -fsSL https://qbraid.com/code.sh | bash -s -- --global
-```
+The older global thinking-disable workaround is gone. A live Sol probe also
+succeeded with Claude Code's default thinking when MCP tools were excluded. The
+128-tool limit is independent of thinking.
 
-```powershell
-& ([scriptblock]::Create((irm https://qbraid.com/code.ps1))) -Global
-```
+### Plain `claude`
+
+The installer leaves plain `claude` untouched. Legacy qBraid gateway variables
+are removed from user settings during migration. `--global` is rejected because
+a project setting can replace the base URL and exfiltrate a reusable key.
 
 ## How it works
 
-Claude Code speaks the Anthropic Messages API. So does the qBraid gateway — it
-exposes an Anthropic-compatible surface at `/api/v1/ai/v1/messages` (the double
-`v1` is deliberate, so `ANTHROPIC_BASE_URL` works with no client changes).
+Claude Code sends Anthropic Messages requests to the qBraid gateway. The local
+proxy translates only the GPT routes.
 
-```
-qbraid-code
-   │  ANTHROPIC_BASE_URL=https://api-v2.qbraid.com/api/v1/ai
-   │  ANTHROPIC_AUTH_TOKEN=qbr_...
-   ▼
-Claude Code ──Anthropic Messages──► qBraid AI gateway ──► Claude on Bedrock
+```text
+qbraid-code ── loopback CLIProxyAPI
+                 ├─ Claude passthrough ── qBraid gateway
+                 └─ GPT translation ──── qBraid gateway
 ```
 
-**There is no proxy and no daemon.** Nothing runs in the background, nothing
-listens on a port. The launcher sets four environment variables and execs
-`claude`.
+Requests use qBraid credits at the usual rate. One hundred credits equal one US
+dollar.
 
-Requests are billed against your qBraid credits at the usual rate
-(100 credits = $1).
+## qBraid MCP
 
-## The qBraid MCP
-
-The MCP endpoint at `mcp.qbraid.com/mcp` uses OAuth, not API keys, so it needs a
-browser sign-in that your API key cannot do for you. The installer runs it during
-setup, while you are still there. If you skipped it:
+The MCP endpoint uses OAuth rather than API keys. Sign in with a browser.
 
 ```bash
 claude mcp login qbraid
@@ -120,61 +154,46 @@ claude mcp login qbraid
 
 ## Layout
 
-| Path | What |
+| Path | Purpose |
 |---|---|
-| `~/.qbraid-code/env` | your key, gateway URL and default model (mode `600`) |
-| `~/.qbraid-code/statusline.sh` | statusline script (`statusline.ps1` on Windows) |
-| `~/.qbraid-code/credits.cache` | last known credit balance, refreshed every 60s |
-| `~/.qbraid-code/credits.attempt` | when a refresh was last tried, so failures back off |
-| `~/.qbraid-code/proxy-config.yaml` | GPT translation proxy config (mode `600`, holds your key) |
-| `~/.qbraid-code/proxy.key` | loopback bearer for the proxy |
-| `~/.qbraid-code/proxy.log` | proxy output |
-| `~/.local/bin/qbraid-code` | the launcher (`qbraid-code.cmd` on Windows) |
-| `~/.claude/settings.json` | statusline wiring, plus gateway env with `--global` |
+| `~/.qbraid-code/active-profile` | Future-session profile pointer |
+| `~/.qbraid-code/profiles/<name>/current` | Atomic metadata-generation pointer |
+| `~/.qbraid-code/profiles/<name>/generations/*/env` | URLs, model, secret reference, and proxy binary |
+| `~/.qbraid-code/profiles/<name>/generations/*/label*` | Readable label and verified/local provenance |
+| `~/.qbraid-code/profiles/<name>/generations/*/models.tsv` | Exact model context facts |
+| `~/.qbraid-code/secrets/*` | Linux-only private key fallback |
+| `~/.qbraid-code/runtime.*` | Short-lived proxy state |
+| `~/.qbraid-code/session.*` | Short-lived non-secret status snapshot |
+| `~/.qbraid-code/statusline.sh` | Unix statusline adapter |
+| `~/.local/bin/qbraid-code` | Unix launcher |
+
+Windows uses the same layout under `%USERPROFILE%\.qbraid-code`.
 
 ## Troubleshooting
 
-Start with `qbraid-code --doctor`. It reports whether Claude Code is installed,
-whether your key still works, your credit balance, whether the gateway is
-reachable, and whether the MCP is registered.
+Start with `qbraid-code --doctor`.
 
-**`key: REJECTED`** — your API key was deleted or expired. Make a new one at
-[account.qbraid.com/account/api-keys](https://account.qbraid.com/account/api-keys)
-and re-run the installer.
+**Rejected key.** Create a key at
+[account.qbraid.com/account/api-keys](https://account.qbraid.com/account/api-keys),
+then update the affected profile.
 
-**`qbraid-code: command not found`** — `~/.local/bin` is not on your `PATH`. The
-installer prints the line to add. On Windows, open a new terminal first.
+**Wrong account label.** Reinstall with `QBRAID_CODE_PROFILE_LABEL` set to a
+readable local name. API-key authentication does not always expose an
+authoritative organization name.
 
-**Wrong organization** — credits come from the organization the key belongs to.
-Create a key under the organization you want, then re-run the installer.
+**GPT proxy unavailable.** Re-run the installer for that profile. Claude models
+continue to use the gateway directly.
 
-**Statusline did not appear** — when `python3` is unavailable (no Xcode Command
-Line Tools on macOS, or no `python3` on Linux) and `~/.claude/settings.json`
-already exists, the installer cannot merge JSON safely and skips this step. It
-prints the snippet to add by hand.
-
-## Trust
-
-The installer is served from `qbraid.com` but its source of truth is the `main`
-branch of this repository, fetched at request time with no pin and no signature.
-Anyone who can push here can change what a `curl | bash` runs, which is the
-normal trade-off for a one-line installer that must stay current. Two things
-follow from that: branch protection on `main` is load-bearing, and if you would
-rather read before you run, fetch the script and inspect it first:
-
-```bash
-curl -fsSL https://qbraid.com/code.sh -o install.sh
-less install.sh
-bash install.sh
-```
+**Statusline missing.** Add the printed `statusLine` entry to
+`~/.claude/settings.json`. The Unix installer does not rewrite existing JSON
+without a real parser.
 
 ## Uninstall
 
 ```bash
 qbraid-code --stop
-rm -rf ~/.qbraid-code ~/.local/bin/qbraid-code
+rm -rf ~/.qbraid-code ~/.local/bin/qbraid-code ~/.local/bin/qbraid-code.home
 claude mcp remove qbraid
 ```
 
-Then remove the `statusLine` entry (and the `env` block, if you used `--global`)
-from `~/.claude/settings.json`.
+Remove the qBraid `statusLine` from `~/.claude/settings.json`.

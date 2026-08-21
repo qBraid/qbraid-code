@@ -13,26 +13,29 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
 
 $HomeDir = if ($env:QBRAID_CODE_HOME) { $env:QBRAID_CODE_HOME } else { Join-Path $env:USERPROFILE '.qbraid-code' }
-$Cache   = Join-Path $HomeDir 'credits.cache'
-# Stamped before each refresh ATTEMPT, not after a success. Without it a failing
-# balance call leaves the cache untouched, so every render decides a refresh is
-# due and starts another powershell.exe — several a second, all session.
-$Attempt = Join-Path $HomeDir 'credits.attempt'
-$Ttl     = 60
-
-$apiBase = 'https://api-v2.qbraid.com/api/v1'
-$token   = ''
-$envPath = Join-Path $HomeDir 'env'
-if (Test-Path $envPath) {
-    foreach ($line in Get-Content $envPath) {
-        if ($line -match '^\s*QBRAID_CODE_API_BASE\s*=\s*(.*)$') { $apiBase = $Matches[1] }
-        if ($line -match '^\s*QBRAID_CODE_TOKEN\s*=\s*(.*)$')    { $token   = $Matches[1] }
+$ProfileDir = $env:QBRAID_CODE_PROFILE_HOME
+if (-not $ProfileDir) {
+    $profile = $env:QBRAID_CODE_PROFILE
+    if (-not $profile -and (Test-Path (Join-Path $HomeDir 'env'))) {
+        $ProfileDir = $HomeDir
+    } else {
+        if (-not $profile -and (Test-Path (Join-Path $HomeDir 'active-profile'))) { $profile = (Get-Content (Join-Path $HomeDir 'active-profile') -Raw).Trim() }
+        if (-not $profile) { $profile = 'default' }
+        $ProfileDir = Join-Path (Join-Path $HomeDir 'profiles') $profile
+        $currentPath = Join-Path $ProfileDir 'current'
+        if (Test-Path $currentPath) {
+            $generation = (Get-Content $currentPath -Raw).Trim()
+            if ($generation -and -not $generation.Contains('/') -and -not $generation.Contains('\') -and -not $generation.StartsWith('.')) { $ProfileDir = Join-Path (Join-Path $ProfileDir 'generations') $generation }
+        }
+        if (-not (Test-Path (Join-Path $ProfileDir 'env')) -and $profile -eq 'default') { $ProfileDir = $HomeDir }
     }
 }
+$Cache = Join-Path $ProfileDir 'credits.cache'
+$Updated = Join-Path $ProfileDir 'credits.updated'
 
 $e    = [char]27
 $dim  = "$e[2m"; $rst = "$e[0m"
-$cyan = "$e[36m"; $grn = "$e[32m"; $ylw = "$e[33m"; $red = "$e[31m"
+$violet = "$e[38;2;168;85;247m"; $grn = "$e[32m"; $ylw = "$e[33m"; $red = "$e[31m"
 
 $raw = [Console]::In.ReadToEnd()
 $data = $null
@@ -63,7 +66,7 @@ if ($null -ne $v) { $remaining = [double]$v }
 
 $name = Split-Path $dir -Leaf
 $branch = & git -C $dir rev-parse --abbrev-ref HEAD 2>$null
-$place = "$cyan$name$rst"
+$place = $name
 if ($branch -and $branch -ne 'HEAD') {
     if ($branch.Length -gt 22) { $branch = $branch.Substring(0, 21) + [char]0x2026 }
     $place = "$place $dim$([char]0x2387) $branch$rst"
@@ -90,53 +93,38 @@ if ($null -ne $remaining) {
 
 # ----------------------------------------------------------------- credits
 
-function Start-CreditRefresh {
-    if (-not $token) { return }
-    # Stamp first: a refresh that fails must still back off for $Ttl seconds.
-    Set-Content -Path $Attempt -Value ([string](Get-Date -UFormat %s)) -Encoding ASCII
-
-    # The child reads the credential out of the env file itself. Passing it in
-    # -ArgumentList would put a live API key on a process command line, which
-    # every user on the machine can read from the process list.
-    $envFile = Join-Path $HomeDir 'env'
-    $script = @'
-$home_dir = $env:QC_ENV_FILE
-$base = ''; $tok = ''
-foreach ($line in Get-Content $home_dir) {
-  if ($line -match '^\s*QBRAID_CODE_API_BASE\s*=\s*(.*)$') { $base = $Matches[1] }
-  if ($line -match '^\s*QBRAID_CODE_TOKEN\s*=\s*(.*)$')    { $tok  = $Matches[1] }
-}
-if (-not $tok) { exit }
-try {
-  $b = Invoke-RestMethod -Uri "$base/billing/credits/balance" -Headers @{ 'X-API-Key' = $tok } -TimeoutSec 15
-  if ($null -ne $b.data.qbraidCredits) {
-    Set-Content -Path $env:QC_CACHE -Value ([string]$b.data.qbraidCredits) -Encoding ASCII
-  }
-} catch { }
-'@
-    $env:QC_ENV_FILE = $envFile
-    $env:QC_CACHE    = $Cache
-    Start-Process -FilePath 'powershell' -WindowStyle Hidden `
-        -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $script
-}
-
 $credits = $null
 if (Test-Path $Cache) { $credits = (Get-Content $Cache -Raw).Trim() }
-
-$due = $true
-if (Test-Path $Attempt) {
-    $due = ((Get-Date) - (Get-Item $Attempt).LastWriteTime).TotalSeconds -ge $Ttl
+$stale = 'stale'
+if (Test-Path $Updated) {
+    $updatedValue = 0L
+    if ([long]::TryParse((Get-Content $Updated -Raw).Trim(), [ref]$updatedValue)) {
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $updatedValue
+        if ($age -le 300) { $stale = '' } else { $stale = "stale $([Math]::Floor($age / 60))m" }
+    }
 }
-if ($due) { Start-CreditRefresh }
-
-$creditSeg = ''
+$label = $env:QBRAID_CODE_PROFILE
+$labelPath = Join-Path $ProfileDir 'label'
+if (Test-Path $labelPath) { $label = (Get-Content $labelPath -Raw -Encoding UTF8).Trim() }
+if (-not $label) { $label = 'default' }
+$label = $label -replace '[\x00-\x1F\x7F]', ''
+if ($label.Length -gt 40) { $label = $env:QBRAID_CODE_PROFILE; if (-not $label) { $label = 'default' } }
+$sourcePath = Join-Path $ProfileDir 'label-source'
+$labelSource = if (Test-Path $sourcePath) { (Get-Content $sourcePath -Raw).Trim() } else { 'local' }
+if ($labelSource -eq 'local') {
+    $orgPath = Join-Path $ProfileDir 'organization-id'
+    $orgId = if (Test-Path $orgPath) { (Get-Content $orgPath -Raw).Trim() } else { '' }
+    if ($orgId -match '^[A-Za-z0-9._-]+$') { $shortOrg = $orgId.Substring(0, [Math]::Min(8, $orgId.Length)); $label = "$label (local · org $shortOrg…)" } else { $label = "$label (local)" }
+}
+$accountSeg = "${violet}qBraid$rst $label"
 if ($credits) {
     $value = 0.0
     if ([double]::TryParse($credits, [ref]$value)) {
         $colour = $grn
         if ($value -lt 100) { $colour = $ylw }
         if ($value -lt 10)  { $colour = $red }
-        $creditSeg = "$colour$([Math]::Round($value))$rst$dim credits$rst"
+        $staleSuffix = if ($stale) { " $([char]0x00B7) $stale" } else { '' }
+        $accountSeg = "$accountSeg$dim $([char]0x00B7) $rst$colour$([Math]::Round($value))$rst$dim credits$staleSuffix$rst"
     }
 }
 
@@ -145,5 +133,5 @@ if ($credits) {
 $sep = "$dim $([char]0x2502) $rst"
 $out = "$place$sep$dim$model$rst"
 if ($bar)       { $out = "$out$sep$bar" }
-if ($creditSeg) { $out = "$out$sep$creditSeg" }
+$out = "$out$sep$accountSeg"
 Write-Output $out
