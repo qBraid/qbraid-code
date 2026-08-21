@@ -72,6 +72,9 @@ check "zero credits renders" "$FULL" '0 credits'
 
 printf '4281.4' > "$TMP/credits.cache"
 check "credits are rounded"  "$FULL" '4281 credits'
+printf 'expired\n' > "$TMP/key-status"
+check "confirmed rejection marks the key expired" "$FULL" 'key expired'
+rm -f "$TMP/key-status"
 
 printf '%s
 ' "$(( $(date +%s) - 600 ))" > "$TMP/credits.updated"

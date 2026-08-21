@@ -103,6 +103,10 @@ echo args=%*
     $env:QBRAID_CODE_PROFILE_HOME = $beta
     $status = ('{"model":{"display_name":"Haiku"},"workspace":{"current_dir":"C:\\tmp"}}' | & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'statusline.ps1')) -join "`n"
     if ($status -notmatch 'qBraid' -or $status -notmatch 'Beta Lab' -or $status -notmatch '19') { throw "status binding failed: $status" }
+    'expired' | Set-Content (Join-Path $beta 'key-status') -Encoding ASCII
+    $expiredStatus = ('{}' | & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'statusline.ps1')) -join "`n"
+    if ($expiredStatus -notmatch 'key expired') { throw "expired key status missing: $expiredStatus" }
+    Remove-Item (Join-Path $beta 'key-status') -Force
 
     function global:claude {
         $joined = $args -join ' '

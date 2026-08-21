@@ -32,6 +32,8 @@ if (-not $ProfileDir) {
 }
 $Cache = Join-Path $ProfileDir 'credits.cache'
 $Updated = Join-Path $ProfileDir 'credits.updated'
+$KeyStatusPath = Join-Path $ProfileDir 'key-status'
+$KeyStatus = if (Test-Path $KeyStatusPath) { (Get-Content $KeyStatusPath -Raw).Trim() } else { '' }
 
 $e    = [char]27
 $dim  = "$e[2m"; $rst = "$e[0m"
@@ -117,7 +119,9 @@ if ($labelSource -eq 'local') {
     if ($orgId -match '^[A-Za-z0-9._-]+$') { $shortOrg = $orgId.Substring(0, [Math]::Min(8, $orgId.Length)); $label = "$label (local $([char]0x00B7) org $shortOrg$([char]0x2026))" } else { $label = "$label (local)" }
 }
 $accountSeg = "${violet}qBraid$rst $label"
-if ($credits) {
+if ($KeyStatus -eq 'expired') {
+    $accountSeg = "$accountSeg$dim $([char]0x00B7) $rst${red}key expired$rst"
+} elseif ($credits) {
     $value = 0.0
     if ([double]::TryParse($credits, [ref]$value)) {
         $colour = $grn

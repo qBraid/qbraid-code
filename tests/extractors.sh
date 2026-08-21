@@ -53,16 +53,30 @@ check "json_str on an empty body survives set -e" \
   "x=\$(json_str '' name); [ -z \"\$x\" ]"
 
 # proxy_supports_gateway_config: grep -q + pipefail must not fail on success.
-FN2=$(awk '/^proxy_supports_gateway_config\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' install.sh)
+FN2=$(printf '%s\n%s\n' "$(extract_fn proxy_binary_is_native)" "$(extract_fn proxy_supports_gateway_config)")
 if [ -n "$FN2" ] && bash -c "set -euo pipefail; $FN2; proxy_supports_gateway_config /bin/ls || true; exit 0"; then
-  # positive case: a file that certainly contains the marker
-  tmpbin=$(mktemp); printf 'xx disable-cloaking-model-list yy' > "$tmpbin"
+  # positive case: a native fixture that contains the marker
+  tmpbin=$(mktemp); rm -f "$tmpbin"; cc tests/fake-proxy.c -o "$tmpbin"
   if bash -c "set -euo pipefail; $FN2; proxy_supports_gateway_config '$tmpbin'"; then
     pass=$((pass + 1)); printf '  ok   proxy_supports_gateway_config survives pipefail\n'
   else
     fail=$((fail + 1)); printf '  FAIL proxy_supports_gateway_config false-negative under pipefail\n'
   fi
   rm -f "$tmpbin"
+  tmpscript=$(mktemp); printf '#!/bin/sh\n# disable-cloaking-model-list\n' > "$tmpscript"
+  if ! bash -c "set -euo pipefail; $FN2; proxy_supports_gateway_config '$tmpscript'"; then
+    pass=$((pass + 1)); printf '  ok   proxy wrapper scripts are rejected\n'
+  else
+    fail=$((fail + 1)); printf '  FAIL proxy wrapper script was accepted\n'
+  fi
+  rm -f "$tmpscript"
+  tmptext=$(mktemp); printf '# disable-cloaking-model-list\nexit 0\n' > "$tmptext"; chmod +x "$tmptext"
+  if ! bash -c "set -euo pipefail; $FN2; proxy_supports_gateway_config '$tmptext'"; then
+    pass=$((pass + 1)); printf '  ok   proxy text executables without shebangs are rejected\n'
+  else
+    fail=$((fail + 1)); printf '  FAIL proxy text executable without shebang was accepted\n'
+  fi
+  rm -f "$tmptext"
 else
   fail=$((fail + 1)); printf '  FAIL proxy_supports_gateway_config extraction or negative case\n'
 fi

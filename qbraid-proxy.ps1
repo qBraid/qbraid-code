@@ -31,12 +31,12 @@ if (-not $ProfileDir) {
     if (-not (Test-Path (Join-Path $ProfileDir 'env')) -and $profile -eq 'default') { $ProfileDir = $HomeDir }
 }
 $Port = 8320
-$Bin = ''
+$Bin = [string]$env:QBRAID_CODE_RUNTIME_PROXY_BIN
 $envPath = Join-Path $ProfileDir 'env'
 if (Test-Path $envPath) {
     foreach ($line in Get-Content $envPath) {
         if ($line -match '^\s*QBRAID_CODE_PROXY_PORT\s*=\s*(.*)$') { $Port = [int]$Matches[1] }
-        if ($line -match '^\s*QBRAID_CODE_PROXY_BIN\s*=\s*(.*)$')  { $Bin  = $Matches[1] }
+        if (-not $Bin -and $line -match '^\s*QBRAID_CODE_PROXY_BIN\s*=\s*(.*)$') { $Bin = $Matches[1] }
     }
 }
 $Config = if ($env:QBRAID_CODE_RUNTIME_CONFIG) { $env:QBRAID_CODE_RUNTIME_CONFIG } else { Join-Path $ProfileDir 'proxy-config.yaml' }
@@ -64,21 +64,23 @@ switch ($Action) {
     'stop' {
         $pidFile = Join-Path $RuntimeDir 'proxy.pid'
         $proxyPid = Read-PidFile $pidFile
-        $owned = $null
-        if ($proxyPid) {
-            $owned = Get-CimInstance Win32_Process -Filter "ProcessId=$proxyPid" -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Config) }
+        $running = if ($proxyPid) { Get-Process -Id $proxyPid -ErrorAction SilentlyContinue } else { $null }
+        if (-not $running) { Write-Output 'proxy was not running'; exit 0 }
+        $record = Get-CimInstance Win32_Process -Filter "ProcessId=$proxyPid" -ErrorAction SilentlyContinue
+        if (-not $record -or -not $record.CommandLine -or -not $record.ExecutablePath) { Write-Error "cannot verify proxy process $proxyPid"; exit 1 }
+        $configPattern = '(?i)(?:^|\s)-config\s+(?:"' + [regex]::Escape($Config) + '"|' + [regex]::Escape($Config) + ')(?:\s|$)'
+        if ($record.CommandLine -notmatch $configPattern) { Write-Output 'proxy was not running'; exit 0 }
+        if (-not $Bin -or -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($record.ExecutablePath), [IO.Path]::GetFullPath($Bin))) {
+            Write-Error "process $proxyPid uses the runtime config but is not the owned proxy executable"
+            exit 1
         }
-        if ($owned) {
-            Stop-Process -Id $proxyPid -Force -ErrorAction SilentlyContinue
-            Wait-Process -Id $proxyPid -Timeout 5 -ErrorAction SilentlyContinue
-            if (-not (Get-Process -Id $proxyPid -ErrorAction SilentlyContinue)) {
-                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-            }
-            Write-Output 'proxy stopped'
-        } else {
-            Write-Output 'proxy was not running'
+        Stop-Process -Id $proxyPid -Force -ErrorAction Stop
+        for ($attempt = 0; $attempt -lt 50 -and (Get-Process -Id $proxyPid -ErrorAction SilentlyContinue); $attempt++) {
+            Start-Sleep -Milliseconds 100
         }
+        if (Get-Process -Id $proxyPid -ErrorAction SilentlyContinue) { Write-Error "could not stop owned proxy process $proxyPid"; exit 1 }
+        Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+        Write-Output 'proxy stopped'
         exit 0
     }
     'ensure' {
@@ -98,8 +100,12 @@ switch ($Action) {
             if (Test-Proxy) { exit 0 }
             Start-Sleep -Milliseconds 300
         }
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-        Wait-Process -Id $process.Id -Timeout 5 -ErrorAction SilentlyContinue
+        $process.Refresh()
+        if (-not $process.HasExited) {
+            $process.Kill()
+            [void]$process.WaitForExit(5000)
+        }
+        if (-not $process.HasExited) { Write-Error "could not stop failed proxy process $($process.Id)"; exit 1 }
         Remove-Item (Join-Path $RuntimeDir 'proxy.pid') -Force -ErrorAction SilentlyContinue
         Write-Error "proxy failed to start - see $LogFile"
         exit 1

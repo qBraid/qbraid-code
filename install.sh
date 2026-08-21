@@ -44,6 +44,7 @@ CLAUDE_JSON="$HOME/.claude.json"
 
 PROFILE="${QBRAID_CODE_PROFILE:-}"
 PROFILE_OPTION=0
+UPDATE_KEY=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --global) printf 'error: --global was removed because project settings can exfiltrate its credential. Use qbraid-code.\n' >&2; exit 1 ;;
@@ -51,11 +52,13 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || { printf 'error: --profile needs a name\n' >&2; exit 1; }
       PROFILE_OPTION=1; PROFILE="$2"; shift 2 ;;
     --profile=*) PROFILE_OPTION=1; PROFILE="${1#--profile=}"; shift ;;
+    --update-key) UPDATE_KEY=1; shift ;;
     --help|-h)
       cat <<'EOF'
 qbraid-code installer
 
   --profile NAME   create or update a named qBraid profile
+  --update-key     require a replacement key for an existing profile
   --global         removed. Use the isolated qbraid-code wrapper.
   --help           show this message
 
@@ -98,6 +101,64 @@ sanitize_profile_label() { # sanitize_profile_label <label> <fallback>
   if [ -n "$label" ] && [ "$bytes" -le 80 ]; then printf '%s' "$label"; else printf '%s' "$2"; fi
 }
 
+canonical_executable() {
+  local path="$1" target hops=0 directory
+  case "$path" in /*) ;; *) return 1 ;; esac
+  while [ -L "$path" ] && [ "$hops" -lt 40 ]; do
+    target=$(readlink "$path" 2>/dev/null) || return 1
+    case "$target" in /*) path="$target" ;; *) path="$(dirname -- "$path")/$target" ;; esac
+    hops=$((hops + 1))
+  done
+  [ "$hops" -lt 40 ] && [ -e "$path" ] || return 1
+  directory=$(CDPATH='' cd -- "$(dirname -- "$path")" 2>/dev/null && pwd -P) || return 1
+  printf '%s/%s' "$directory" "$(basename -- "$path")"
+}
+
+process_command() {
+  local pid="$1"
+  if [ -r "/proc/$pid/cmdline" ]; then tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true
+  elif command -v ps >/dev/null 2>&1; then ps -p "$pid" -o command= 2>/dev/null || true
+  fi
+}
+
+process_executable() {
+  local pid="$1"
+  if [ -L "/proc/$pid/exe" ]; then readlink "/proc/$pid/exe" 2>/dev/null || true
+  elif [ -x /usr/sbin/lsof ]; then (set +o pipefail; /usr/sbin/lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1) || true
+  elif command -v lsof >/dev/null 2>&1; then (set +o pipefail; lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1) || true
+  fi
+}
+
+proxy_process_is_owned() {
+  local pid="$1" proxy_bin="$2" config="$3" command executable expected
+  command=$(process_command "$pid"); command=${command% }
+  executable=$(process_executable "$pid")
+  if [ -n "$proxy_bin" ] && [ "$command" = "$proxy_bin -config $config" ]; then
+    expected=$(canonical_executable "$proxy_bin" 2>/dev/null || true)
+    [ -n "$expected" ] && [ "$executable" = "$expected" ] && return 0
+    return 2
+  fi
+  case "$command" in *" -config $config") return 2 ;; esac
+  [ -n "$command" ] && [ -n "$executable" ] || return 2
+  return 1
+}
+
+stop_verified_proxy() {
+  local pid="$1" proxy_bin="$2" config="$3" i=0 rc=0
+  kill -0 "$pid" 2>/dev/null || return 0
+  proxy_process_is_owned "$pid" "$proxy_bin" "$config" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) die "cannot verify ownership of stale proxy process $pid." ;;
+  esac
+  kill "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; sleep 0.1; fi
+  if kill -0 "$pid" 2>/dev/null; then die "could not stop owned stale proxy process $pid."; fi
+  return 0
+}
+
 adopt_legacy_profile() { # adopt_legacy_profile <root>
   local root="$1" dest="$1/profiles/default" stage item token secret_ref account
   [ -f "$root/env" ] || return 0
@@ -122,7 +183,7 @@ adopt_legacy_profile() { # adopt_legacy_profile <root>
       printf 'QBRAID_CODE_SECRET_BACKEND=file\nQBRAID_CODE_SECRET_REF=%s\n' "$secret_ref" >> "$stage/env"
     fi
   fi
-  for item in label models.tsv credits.cache credits.updated organization-id label-source; do
+  for item in label models.tsv credits.cache credits.updated credits.attempt organization-id label-source proxy-template.yaml; do
     [ -e "$root/$item" ] || continue
     cp -R "$root/$item" "$stage/$item"
   done
@@ -133,18 +194,21 @@ adopt_legacy_profile() { # adopt_legacy_profile <root>
 }
 
 scrub_legacy_token() { # scrub_legacy_token <root>
-  local root="$1" proxy_pid="" proxy_command="" keep_config=0
+  local root="$1" proxy_pid="" proxy_bin="" keep_config=0 rc=0
   [ -e "$root/profiles/default" ] || return 0
   if [ -f "$root/env" ]; then
     { grep -v '^QBRAID_CODE_TOKEN=' "$root/env" || true; } > "$root/env.migrate.$$"
     chmod 600 "$root/env.migrate.$$"; mv "$root/env.migrate.$$" "$root/env"
   fi
   proxy_pid=$(cat "$root/proxy.pid" 2>/dev/null || true)
+  proxy_bin=$({ sed -n 's/^QBRAID_CODE_PROXY_BIN=//p' "$root/env" 2>/dev/null || true; } | head -1)
   if [ -n "$proxy_pid" ] && kill -0 "$proxy_pid" 2>/dev/null; then
-    keep_config=1
-    if [ -r "/proc/$proxy_pid/cmdline" ]; then proxy_command=$(tr '\000' ' ' < "/proc/$proxy_pid/cmdline" 2>/dev/null || true)
-    elif command -v ps >/dev/null 2>&1; then proxy_command=$(ps -p "$proxy_pid" -o command= 2>/dev/null || true); fi
-    case "$proxy_command" in '') ;; *"$root/proxy-config.yaml"*) ;; *) keep_config=0 ;; esac
+    proxy_process_is_owned "$proxy_pid" "$proxy_bin" "$root/proxy-config.yaml" || rc=$?
+    case "$rc" in
+      0) keep_config=1 ;;
+      1) keep_config=0 ;;
+      *) keep_config=1; warn "could not verify the live legacy proxy; preserving its runtime config." ;;
+    esac
   fi
   [ "$keep_config" -eq 1 ] || rm -f "$root/proxy-config.yaml"
 }
@@ -445,20 +509,112 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
 command -v curl >/dev/null || die "curl is required but not installed."
+lock_dir_is_stale() {
+  local lock_dir="$1" owner="" modified="" now=""
+  owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  case "$owner" in
+    ''|*[!0-9]*)
+      modified=$(stat -c '%Y' "$lock_dir" 2>/dev/null || stat -f '%m' "$lock_dir" 2>/dev/null || true)
+      now=$(date +%s)
+      [ -n "$modified" ] && [ $((now - modified)) -ge 30 ] ;;
+    *) ! kill -0 "$owner" 2>/dev/null ;;
+  esac
+}
+
+acquire_lock_dir() {
+  local lock_dir="$1" candidate="$1.reclaim.$$" legacy="$1.reclaim" guard leader=""
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+  lock_dir_is_stale "$lock_dir" || return 1
+  if [ -d "$legacy" ]; then
+    lock_dir_is_stale "$legacy" || return 1
+    rm -rf "$legacy"
+  fi
+  mkdir "$candidate" 2>/dev/null || return 1
+  printf '%s\n' "$$" > "$candidate/pid"
+  sleep 0.1
+  for guard in "$lock_dir".reclaim.*; do
+    [ -d "$guard" ] || continue
+    if [ "$guard" != "$candidate" ] && lock_dir_is_stale "$guard"; then rm -rf "$guard"; continue; fi
+    [ -f "$guard/leader" ] || continue
+    if [ -z "$leader" ] || [[ "$guard" < "$leader" ]]; then leader="$guard"; fi
+  done
+  if [ -z "$leader" ]; then
+    for guard in "$lock_dir".reclaim.*; do
+      [ -d "$guard" ] || continue
+      if [ -z "$leader" ] || [[ "$guard" < "$leader" ]]; then leader="$guard"; fi
+    done
+    if [ "$leader" = "$candidate" ]; then : > "$candidate/leader"; fi
+  fi
+  sleep 0.1
+  leader=""
+  for guard in "$lock_dir".reclaim.*; do
+    [ -d "$guard" ] && [ -f "$guard/leader" ] || continue
+    if [ -z "$leader" ] || [[ "$guard" < "$leader" ]]; then leader="$guard"; fi
+  done
+  if [ "$leader" != "$candidate" ]; then rm -rf "$candidate"; return 1; fi
+  if ! lock_dir_is_stale "$lock_dir"; then rm -rf "$candidate"; return 1; fi
+  rm -rf "$lock_dir"
+  if ! mkdir "$lock_dir" 2>/dev/null; then rm -rf "$candidate"; return 1; fi
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  rm -rf "$candidate"
+}
+
 say "Platform: $OS/$ARCH"
+
+NORMALIZED_HOME_DIR=$(printf '%s' "${HOME_DIR%/}" | sed 's#//*#/#g')
+[ -n "$NORMALIZED_HOME_DIR" ] || NORMALIZED_HOME_DIR=/
+DEFAULT_HOME_DIR=$(printf '%s' "${HOME%/}/.qbraid-code" | sed 's#//*#/#g')
+case "/$NORMALIZED_HOME_DIR/" in */../*|*/./*) die "custom install directory contains dot segments." ;; esac
+if [ "$NORMALIZED_HOME_DIR" != "$DEFAULT_HOME_DIR" ]; then
+  if [ -e "$NORMALIZED_HOME_DIR" ]; then
+    PHYSICAL_CUSTOM_HOME=$(CDPATH='' cd -- "$NORMALIZED_HOME_DIR" 2>/dev/null && pwd -P) || die "could not resolve custom install directory."
+  else
+    PHYSICAL_CUSTOM_HOME=$(CDPATH='' cd -- "$(dirname -- "$NORMALIZED_HOME_DIR")" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$(basename -- "$NORMALIZED_HOME_DIR")") \
+      || die "could not resolve the custom install parent."
+  fi
+  [ "$PHYSICAL_CUSTOM_HOME" = "$NORMALIZED_HOME_DIR" ] || die "custom install directory uses a symbolic-link component or alias."
+fi
+if [ -d "$NORMALIZED_HOME_DIR" ]; then
+  command -v find >/dev/null 2>&1 || die "find is required to verify install paths."
+  MANAGED_LINK=$(find "$NORMALIZED_HOME_DIR" -type l -print -quit 2>/dev/null) || die "could not verify install paths."
+  [ -z "$MANAGED_LINK" ] || die "custom install directory contains symbolic link '$MANAGED_LINK'."
+fi
+if [ "$NORMALIZED_HOME_DIR" != "$DEFAULT_HOME_DIR" ] && [ -d "$NORMALIZED_HOME_DIR" ]; then
+  MARKER_VALUE=""
+  MIGRATABLE_CUSTOM=0
+  [ ! -L "$NORMALIZED_HOME_DIR/.qbraid-code-install" ] && MARKER_VALUE=$(cat "$NORMALIZED_HOME_DIR/.qbraid-code-install" 2>/dev/null || true)
+  if [ "$MARKER_VALUE" != qbraid-code ] && [ -n "$(ls -A "$NORMALIZED_HOME_DIR" 2>/dev/null)" ]; then
+    SIDECAR_HOME=$(cat "$BIN_DIR/qbraid-code.home" 2>/dev/null || true)
+    SIDECAR_HOME=$(printf '%s' "$SIDECAR_HOME" | sed 's#//*#/#g')
+    while [ "$SIDECAR_HOME" != / ] && [ "${SIDECAR_HOME%/}" != "$SIDECAR_HOME" ]; do SIDECAR_HOME=${SIDECAR_HOME%/}; done
+    if [ "$SIDECAR_HOME" = "$NORMALIZED_HOME_DIR" ]; then
+      MIGRATABLE_CUSTOM=1
+      for OWNED_ENTRY in "$NORMALIZED_HOME_DIR"/* "$NORMALIZED_HOME_DIR"/.[!.]* "$NORMALIZED_HOME_DIR"/..?*; do
+        [ -e "$OWNED_ENTRY" ] || [ -L "$OWNED_ENTRY" ] || continue
+        [ ! -L "$OWNED_ENTRY" ] || { MIGRATABLE_CUSTOM=0; break; }
+        case ${OWNED_ENTRY##*/} in
+          profiles|secrets|ports|active-profile|global-profile|env|label|label-source|models.tsv|credits.cache|credits.updated|credits.attempt|organization-id|statusline.sh|cliproxyapi|proxy-config.yaml|proxy-template.yaml|proxy.key|proxy-auth|proxy.pid|session-users|.coord-lock|.update-lock|.install-lock|.qbraid-code-install.tmp.*|runtime.*|session.*) ;;
+          *) MIGRATABLE_CUSTOM=0; break ;;
+        esac
+      done
+    fi
+    [ "$MIGRATABLE_CUSTOM" -eq 1 ] || die "custom install directory '$NORMALIZED_HOME_DIR' is nonempty and not exclusively owned by qbraid-code. Choose an empty directory."
+  fi
+fi
+HOME_DIR="$NORMALIZED_HOME_DIR"
 
 mkdir -p "$HOME_DIR" "$BIN_DIR" "$CLAUDE_DIR"
 INSTALL_LOCK="$HOME_DIR/.install-lock"
-if ! mkdir "$INSTALL_LOCK" 2>/dev/null; then
-  LOCK_PID=$(cat "$INSTALL_LOCK/pid" 2>/dev/null || true)
-  if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null; then
-    die "another qbraid-code installer is running."
-  fi
-  rm -rf "$INSTALL_LOCK"
-  mkdir "$INSTALL_LOCK" 2>/dev/null || die "another qbraid-code installer is running."
-fi
-printf '%s\n' "$$" > "$INSTALL_LOCK/pid"
+acquire_lock_dir "$INSTALL_LOCK" || die "another qbraid-code installer is running."
+rm -f "$HOME_DIR"/.qbraid-code-install.tmp.*
+printf 'qbraid-code\n' > "$HOME_DIR/.qbraid-code-install.tmp.$$"
+chmod 600 "$HOME_DIR/.qbraid-code-install.tmp.$$"
+mv "$HOME_DIR/.qbraid-code-install.tmp.$$" "$HOME_DIR/.qbraid-code-install"
 PROFILE_UPDATE_LOCK=""
+PROFILE_COORD_LOCK=""
 PROFILE_STAGE=""
 SECRET_STAGED=0
 SECRET_BACKEND=""
@@ -469,9 +625,20 @@ cleanup_installer() {
   fi
   [ -z "$PROFILE_STAGE" ] || rm -rf "$PROFILE_STAGE"
   [ -z "$PROFILE_UPDATE_LOCK" ] || rm -rf "$PROFILE_UPDATE_LOCK"
+  rm -rf "$INSTALL_LOCK.reclaim.$$"
+  [ -z "$PROFILE_COORD_LOCK" ] || rm -rf "$PROFILE_COORD_LOCK.reclaim.$$"
   rm -rf "$INSTALL_LOCK"
 }
-trap cleanup_installer EXIT INT TERM HUP
+abort_installer() {
+  local status="$1"
+  trap - EXIT INT TERM HUP
+  cleanup_installer
+  exit "$status"
+}
+trap cleanup_installer EXIT
+trap 'abort_installer 130' INT
+trap 'abort_installer 143' TERM
+trap 'abort_installer 129' HUP
 adopt_legacy_profile "$HOME_DIR"
 if [ -z "$PROFILE" ] && [ -f "$HOME_DIR/active-profile" ]; then
   IFS= read -r PROFILE < "$HOME_DIR/active-profile" || true
@@ -479,6 +646,9 @@ fi
 [ -n "$PROFILE" ] || PROFILE=default
 valid_profile_slug "$PROFILE" || die "invalid profile '$PROFILE'. Use letters, numbers, dot, underscore, or dash."
 PROFILE_ROOT="$HOME_DIR/profiles/$PROFILE"
+if [ "$UPDATE_KEY" -eq 1 ] && [ ! -f "$PROFILE_ROOT/current" ] && [ ! -f "$PROFILE_ROOT/env" ]; then
+  die "profile '$PROFILE' is not installed. Create it without --update-key first."
+fi
 mkdir -p "$PROFILE_ROOT"
 chmod 700 "$PROFILE_ROOT" 2>/dev/null || true
 PROFILE_DIR="$PROFILE_ROOT"
@@ -488,13 +658,11 @@ if [ -f "$PROFILE_ROOT/current" ]; then
   [ -f "$PROFILE_ROOT/generations/$CURRENT_GENERATION/env" ] || die "profile '$PROFILE' generation is incomplete."
   PROFILE_DIR="$PROFILE_ROOT/generations/$CURRENT_GENERATION"
 fi
+OLD_MODEL=$({ sed -n 's/^QBRAID_CODE_MODEL=//p' "$PROFILE_DIR/env" 2>/dev/null || true; } | head -1)
+OLD_PROFILE_LABEL=$(cat "$PROFILE_DIR/label" 2>/dev/null || true)
+OLD_PROFILE_LABEL_SOURCE=$(cat "$PROFILE_DIR/label-source" 2>/dev/null || true)
 PROFILE_COORD_LOCK="$PROFILE_ROOT/.coord-lock"
-if ! mkdir "$PROFILE_COORD_LOCK" 2>/dev/null; then
-  COORD_PID=$(cat "$PROFILE_COORD_LOCK/pid" 2>/dev/null || true)
-  if [ -n "$COORD_PID" ] && kill -0 "$COORD_PID" 2>/dev/null; then die "profile '$PROFILE' is busy."; fi
-  rm -rf "$PROFILE_COORD_LOCK"; mkdir "$PROFILE_COORD_LOCK" || die "profile '$PROFILE' is busy."
-fi
-printf '%s\n' "$$" > "$PROFILE_COORD_LOCK/pid"
+acquire_lock_dir "$PROFILE_COORD_LOCK" || die "profile '$PROFILE' is busy."
 PROFILE_UPDATE_LOCK="$PROFILE_ROOT/.update-lock"
 rm -rf "$PROFILE_UPDATE_LOCK"
 mkdir "$PROFILE_UPDATE_LOCK"
@@ -511,14 +679,10 @@ for user_file in "$PROFILE_ROOT"/session-users/*; do
 done
 rm -rf "$PROFILE_COORD_LOCK"
 STALE_PROXY_PID=$(cat "$PROFILE_DIR/proxy.pid" 2>/dev/null || true)
+STALE_PROXY_BIN=$({ sed -n 's/^QBRAID_CODE_PROXY_BIN=//p' "$PROFILE_DIR/env" 2>/dev/null || true; } | head -1)
 if [ -n "$STALE_PROXY_PID" ]; then
-  STALE_PROXY_COMMAND=""
-  if ! kill -0 "$STALE_PROXY_PID" 2>/dev/null; then rm -f "$PROFILE_DIR/proxy.pid"
-  else
-    if [ -r "/proc/$STALE_PROXY_PID/cmdline" ]; then STALE_PROXY_COMMAND=$(tr '\000' ' ' < "/proc/$STALE_PROXY_PID/cmdline" 2>/dev/null || true)
-    elif command -v ps >/dev/null 2>&1; then STALE_PROXY_COMMAND=$(ps -p "$STALE_PROXY_PID" -o command= 2>/dev/null || true); fi
-    case "$STALE_PROXY_COMMAND" in *" -config $PROFILE_DIR/proxy-config.yaml"*) kill "$STALE_PROXY_PID" 2>/dev/null || true; rm -f "$PROFILE_DIR/proxy.pid" ;; esac
-  fi
+  stop_verified_proxy "$STALE_PROXY_PID" "$STALE_PROXY_BIN" "$PROFILE_DIR/proxy-config.yaml"
+  rm -f "$PROFILE_DIR/proxy.pid"
 fi
 EXISTING_PORT=""
 if [ -f "$PROFILE_DIR/env" ]; then EXISTING_PORT=$(sed -n 's/^QBRAID_CODE_PROXY_PORT=//p' "$PROFILE_DIR/env" | head -1); fi
@@ -546,10 +710,21 @@ for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "AN
     env.pop(key, None)
 if not env:
     data.pop("env", None)
-tmp = path + ".qbraid-code.tmp"
-with open(tmp, "w") as fh:
-    json.dump(data, fh, indent=2)
-os.replace(tmp, path)
+import stat, tempfile
+fd, tmp = tempfile.mkstemp(prefix=".qbraid-code-", dir=os.path.dirname(path) or ".")
+try:
+    os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+    with os.fdopen(fd, "w") as fh:
+        fd = -1
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
 PY
   rm -f "$HOME_DIR/global-profile"
   warn "removed unsafe legacy plain-Claude gateway settings; use qbraid-code"
@@ -659,7 +834,7 @@ unreachable_msg="could not reach $GATEWAY_HOST. Check your internet connection a
 say "qBraid account"
 API_KEY="${QBRAID_API_KEY:-}"
 KEY_SOURCE="QBRAID_API_KEY"
-if [ -z "$API_KEY" ]; then
+if [ -z "$API_KEY" ] && [ "$UPDATE_KEY" -eq 0 ]; then
   API_KEY=$(read_profile_secret 2>/dev/null || true)
   [ -z "$API_KEY" ] || KEY_SOURCE="profile secret store"
 fi
@@ -671,7 +846,7 @@ if [ -n "$API_KEY" ]; then
     2) die "$unreachable_msg" ;;
     *) die "the API key from $KEY_SOURCE was rejected by qBraid." ;;
   esac
-else
+elif [ "$UPDATE_KEY" -eq 0 ]; then
   if CANDIDATE=$(read_qbraidrc_key) && [ -n "$CANDIDATE" ]; then
     rc=0; try_key "$CANDIDATE" || rc=$?
     case $rc in
@@ -724,17 +899,35 @@ case "$API_KEY" in
   ''|*[!A-Za-z0-9_.-]*) die "the API key contains unexpected characters — refusing to save it." ;;
 esac
 
+delete_retired_profile_secret() {
+  local backend="$1" ref="$2" error_file rc
+  case "$backend:$ref" in
+    keychain:qbraid-code:"$PROFILE"|keychain:qbraid-code:"$PROFILE":*)
+      if security delete-generic-password -a "${USER:-$(id -un)}" -s "$ref" >/dev/null 2>&1; then return 0; else rc=$?; fi
+      [ "$rc" -eq 44 ] && return 0 ;;
+    secret-service:qbraid-code:"$PROFILE"|secret-service:qbraid-code:"$PROFILE":*)
+      error_file=$(mktemp "${TMPDIR:-/tmp}/qbraid-code-prune.XXXXXX") || return 1
+      chmod 600 "$error_file"
+      if secret-tool clear service qbraid-code ref "$ref" >/dev/null 2>"$error_file"; then rm -f "$error_file"; return 0; else rc=$?; fi
+      if [ "$rc" -eq 1 ] && [ ! -s "$error_file" ]; then rm -f "$error_file"; return 0; fi
+      rm -f "$error_file" ;;
+    file:"$HOME_DIR"/secrets/"$PROFILE"|file:"$HOME_DIR"/secrets/"$PROFILE".*)
+      rm -f -- "$ref" && return 0 ;;
+    *) return 1 ;;
+  esac
+  warn "could not delete retired credential '$ref'; keeping its generation metadata for retry."
+  return 1
+}
+
 prune_profile_generations() { # prune_profile_generations <current-generation>
-  local current="$1" dir env_file backend ref
+  local current="$1" dir env_file backend ref failure=0
   if [ -f "$PROFILE_ROOT/env" ]; then
     backend=$(sed -n 's/^QBRAID_CODE_SECRET_BACKEND=//p' "$PROFILE_ROOT/env" | head -1)
     ref=$(sed -n 's/^QBRAID_CODE_SECRET_REF=//p' "$PROFILE_ROOT/env" | head -1)
-    case "$backend:$ref" in
-      secret-service:qbraid-code:"$PROFILE") secret-tool clear service qbraid-code ref "$ref" >/dev/null 2>&1 || true ;;
-      keychain:qbraid-code:"$PROFILE") security delete-generic-password -a "${USER:-$(id -un)}" -s "$ref" >/dev/null 2>&1 || true ;;
-      file:"$HOME_DIR"/secrets/"$PROFILE") rm -f "$ref" ;;
-    esac
-    rm -f "$PROFILE_ROOT/env" "$PROFILE_ROOT/proxy-template.yaml" "$PROFILE_ROOT/label" "$PROFILE_ROOT/label-source" "$PROFILE_ROOT/models.tsv" "$PROFILE_ROOT/credits.cache" "$PROFILE_ROOT/credits.updated" "$PROFILE_ROOT/organization-id"
+    if delete_retired_profile_secret "$backend" "$ref"; then
+      rm -f "$PROFILE_ROOT/env" "$PROFILE_ROOT/proxy-template.yaml" "$PROFILE_ROOT/label" "$PROFILE_ROOT/label-source" "$PROFILE_ROOT/models.tsv" "$PROFILE_ROOT/credits.cache" "$PROFILE_ROOT/credits.updated" "$PROFILE_ROOT/organization-id" || failure=1
+    else failure=1
+    fi
   fi
   for dir in "$PROFILE_ROOT"/generations/*; do
     [ -d "$dir" ] || continue
@@ -743,14 +936,13 @@ prune_profile_generations() { # prune_profile_generations <current-generation>
     if [ -f "$env_file" ]; then
       backend=$(sed -n 's/^QBRAID_CODE_SECRET_BACKEND=//p' "$env_file" | head -1)
       ref=$(sed -n 's/^QBRAID_CODE_SECRET_REF=//p' "$env_file" | head -1)
-      case "$backend:$ref" in
-        secret-service:qbraid-code:"$PROFILE":*) secret-tool clear service qbraid-code ref "$ref" >/dev/null 2>&1 || true ;;
-        keychain:qbraid-code:"$PROFILE":*) security delete-generic-password -a "${USER:-$(id -un)}" -s "$ref" >/dev/null 2>&1 || true ;;
-        file:"$HOME_DIR"/secrets/"$PROFILE".*) rm -f "$ref" ;;
-      esac
     fi
-    rm -rf "$dir"
+    if [ -z "$backend" ] || delete_retired_profile_secret "$backend" "$ref"; then
+      rm -rf "$dir" || failure=1
+    else failure=1
+    fi
   done
+  [ "$failure" -eq 0 ]
 }
 
 # ------------------------------------------------------- 4. organization check
@@ -807,6 +999,9 @@ fi
 ok "account confirmed"
 
 OLD_ORG_ID=$(cat "$PROFILE_DIR/organization-id" 2>/dev/null || true)
+if [ "$UPDATE_KEY" -eq 1 ] && [ -z "$OLD_ORG_ID" ]; then
+  die "profile '$PROFILE' has no verified organization ID. Create a new profile for the replacement key."
+fi
 if [ -n "$OLD_ORG_ID" ] && { [ -z "$ORG_ID" ] || [ "$OLD_ORG_ID" != "$ORG_ID" ]; }; then
   die "profile '$PROFILE' belongs to another organization. Use a new profile name."
 fi
@@ -819,6 +1014,7 @@ fi
 
 say "Model"
 MODEL="${QBRAID_CODE_MODEL:-}"
+if [ "$UPDATE_KEY" -eq 1 ] && [ -z "$MODEL" ]; then MODEL="$OLD_MODEL"; fi
 if [ -z "$MODEL" ]; then
   # The list is fetched live so new gateway models appear without a release here.
   api_get "$GATEWAY_URL/v1/models" "$API_KEY"
@@ -869,6 +1065,7 @@ rm -rf "$PROFILE_STAGE"; mkdir "$PROFILE_STAGE"; chmod 700 "$PROFILE_STAGE"
 store_profile_secret
 PROFILE_DIR="$PROFILE_STAGE"
 if [ -n "${QBRAID_CODE_PROFILE_LABEL:-}" ]; then PROFILE_LABEL=$(sanitize_profile_label "$QBRAID_CODE_PROFILE_LABEL" "$PROFILE"); PROFILE_LABEL_SOURCE=local
+elif [ "$UPDATE_KEY" -eq 1 ] && [ -n "$OLD_PROFILE_LABEL" ]; then PROFILE_LABEL="$OLD_PROFILE_LABEL"; PROFILE_LABEL_SOURCE="${OLD_PROFILE_LABEL_SOURCE:-local}"
 elif [ -n "$ORG_NAME" ]; then PROFILE_LABEL=$(sanitize_profile_label "$ORG_NAME" "$PROFILE"); PROFILE_LABEL_SOURCE=verified
 else PROFILE_LABEL="$PROFILE"; PROFILE_LABEL_SOURCE=local; fi
 OLD_UMASK=$(umask)
@@ -906,28 +1103,38 @@ if [ -f "${BASH_SOURCE[0]:-}" ]; then
   [ -f "$CAND/qbraid-code" ] && SRC_DIR="$CAND"
 fi
 
-fetch_file() { # fetch_file <name> <dest>
-  local name="$1" dest="$2"
+fetch_file() { # fetch_file <name> <dest> <mode>
+  local name="$1" dest="$2" mode="$3" tmp
+  tmp=$(mktemp "$dest.qbraid-code.XXXXXX") || die "could not create a private temporary file for $name."
+  chmod 0600 "$tmp" || { rm -f "$tmp"; die "could not protect the temporary $name."; }
   if [ -n "$SRC_DIR" ]; then
-    cp "$SRC_DIR/$name" "$dest"; return 0
+    cp "$SRC_DIR/$name" "$tmp" || { rm -f "$tmp"; die "could not stage $name."; }
+  elif curl -fsSL -m 30 -o "$tmp" "$SITE_BASE/$name" 2>/dev/null && [ -s "$tmp" ]; then
+    :
+  elif curl -fsSL -m 30 -o "$tmp" "$RAW_BASE/$name" 2>/dev/null && [ -s "$tmp" ]; then
+    :
+  elif command -v gh >/dev/null 2>&1; then
+    if ! gh api -H "Accept: application/vnd.github.raw" "$GH_CONTENTS/$name" > "$tmp"; then
+      rm -f "$tmp"
+      die "could not download $name — is \`gh auth login\` done, and are you in the qBraid org?"
+    fi
+  else
+    rm -f "$tmp"
+    die "could not download $name from qbraid.com or GitHub. Check your connection and re-run."
   fi
-  if curl -fsSL -m 30 -o "$dest" "$SITE_BASE/$name" 2>/dev/null && [ -s "$dest" ]; then return 0; fi
-  if curl -fsSL -m 30 -o "$dest" "$RAW_BASE/$name" 2>/dev/null && [ -s "$dest" ]; then return 0; fi
-  command -v gh >/dev/null 2>&1 \
-    || die "could not download $name from qbraid.com or GitHub. Check your connection and re-run."
-  gh api -H "Accept: application/vnd.github.raw" "$GH_CONTENTS/$name" > "$dest" \
-    || die "could not download $name — is \`gh auth login\` done, and are you in the qBraid org?"
-  [ -s "$dest" ] || die "downloaded $name but it is empty."
+  [ -s "$tmp" ] || { rm -f "$tmp"; die "downloaded $name but it is empty."; }
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; die "could not set permissions on $name."; }
+  mv "$tmp" "$dest" || { rm -f "$tmp"; die "could not install $name."; }
 }
 
-fetch_file qbraid-code "$BIN_DIR/qbraid-code"
-chmod 0755 "$BIN_DIR/qbraid-code"
-printf '%s\n' "$HOME_DIR" > "$BIN_DIR/qbraid-code.home"
-chmod 0600 "$BIN_DIR/qbraid-code.home"
+fetch_file qbraid-code "$BIN_DIR/qbraid-code" 0755
+SIDECAR_TMP=$(mktemp "$BIN_DIR/qbraid-code.home.XXXXXX") || die 'could not stage the launcher binding.'
+printf '%s\n' "$HOME_DIR" > "$SIDECAR_TMP"
+chmod 0600 "$SIDECAR_TMP"
+mv "$SIDECAR_TMP" "$BIN_DIR/qbraid-code.home" || { rm -f "$SIDECAR_TMP"; die 'could not install the launcher binding.'; }
 ok "launcher installed to $BIN_DIR/qbraid-code"
 
-fetch_file statusline.sh "$HOME_DIR/statusline.sh"
-chmod 0755 "$HOME_DIR/statusline.sh"
+fetch_file statusline.sh "$HOME_DIR/statusline.sh" 0755
 ok "statusline installed to $HOME_DIR/statusline.sh"
 
 # ------------------------------------------------ 7b. GPT models (local proxy)
@@ -940,9 +1147,31 @@ say "GPT models"
 # (CLIProxyAPI >= 7.2.135-ish); an older binary would show the picker reversed
 # pseudo-model gibberish. Feature-detect on the binary itself, not a version
 # number.
+proxy_binary_is_native() {
+  local header system machine suffix
+  header=$(od -An -tx1 -N 20 "$1" 2>/dev/null | tr -d ' \n')
+  system=$(uname -s 2>/dev/null || true)
+  machine=$(uname -m 2>/dev/null || true)
+  case "$system:$machine" in
+    Linux:x86_64|Linux:amd64)
+      [ "${header:0:14}" = 7f454c46020101 ] || return 1
+      suffix=${header:32:8}; [ "$suffix" = 02003e00 ] || [ "$suffix" = 03003e00 ] ;;
+    Linux:aarch64|Linux:arm64)
+      [ "${header:0:14}" = 7f454c46020101 ] || return 1
+      suffix=${header:32:8}; [ "$suffix" = 0200b700 ] || [ "$suffix" = 0300b700 ] ;;
+    Darwin:x86_64)
+      [ "${header:0:16}" = cffaedfe07000001 ] && [ "${header:24:8}" = 02000000 ] ;;
+    Darwin:arm64)
+      [ "${header:0:16}" = cffaedfe0c000001 ] && [ "${header:24:8}" = 02000000 ] ;;
+    *) return 1 ;;
+  esac
+}
+
 proxy_supports_gateway_config() {
+  proxy_binary_is_native "$1" || return 1
   grep -a -q "disable-cloaking-model-list" "$1" 2>/dev/null
 }
+
 
 PROXY_BIN=""
 for cand in "$(command -v cliproxyapi 2>/dev/null || true)" "$HOME_DIR/cliproxyapi"; do
@@ -1055,17 +1284,6 @@ fi
   printf 'QBRAID_CODE_PROXY_BIN=%s\n' "$PROXY_BIN"
 } >> "$PROFILE_DIR/env"
 
-FINAL_GENERATION="$PROFILE_ROOT/generations/$GENERATION"
-mv "$PROFILE_STAGE" "$FINAL_GENERATION"
-PROFILE_STAGE=""
-printf '%s\n' "$GENERATION" > "$PROFILE_ROOT/current.tmp.$$"
-mv "$PROFILE_ROOT/current.tmp.$$" "$PROFILE_ROOT/current"
-SECRET_STAGED=0
-PROFILE_DIR="$FINAL_GENERATION"
-prune_profile_generations "$GENERATION"
-scrub_legacy_token "$HOME_DIR"
-ok "profile '$PROFILE' metadata committed"
-
 # --------------------------------------------------------- 8. first-run flags
 
 say "Claude Code first run"
@@ -1083,10 +1301,21 @@ path = sys.argv[1]
 with open(path) as fh:
     data = json.load(fh)
 data["hasCompletedOnboarding"] = True
-tmp = path + ".qbraid-code.tmp"
-with open(tmp, "w") as fh:
-    json.dump(data, fh, indent=2)
-os.replace(tmp, path)
+import stat, tempfile
+fd, tmp = tempfile.mkstemp(prefix=".qbraid-code-", dir=os.path.dirname(path) or ".")
+try:
+    os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+    with os.fdopen(fd, "w") as fh:
+        fd = -1
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
 PY
     then
       ok "introductory screens will be skipped"
@@ -1122,10 +1351,21 @@ path = sys.argv[1]
 with open(path) as fh:
     data = json.load(fh)
 data["statusLine"] = {"type": "command", "command": os.environ["QC_STATUSLINE"]}
-tmp = path + ".qbraid-code.tmp"
-with open(tmp, "w") as fh:
-    json.dump(data, fh, indent=2)
-os.replace(tmp, path)
+import stat, tempfile
+fd, tmp = tempfile.mkstemp(prefix=".qbraid-code-", dir=os.path.dirname(path) or ".")
+try:
+    os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+    with os.fdopen(fd, "w") as fh:
+        fd = -1
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
 PY
   return 0
 }
@@ -1216,8 +1456,38 @@ esac
 
 # ---------------------------------------------------------------- 12. finish
 
-printf '%s\n' "$PROFILE" > "$HOME_DIR/active-profile.tmp.$$"
-mv "$HOME_DIR/active-profile.tmp.$$" "$HOME_DIR/active-profile"
+FINAL_GENERATION="$PROFILE_ROOT/generations/$GENERATION"
+if ! printf '%s\n' "$GENERATION" > "$PROFILE_ROOT/current.tmp.$$"; then
+  rm -f "$PROFILE_ROOT/current.tmp.$$"
+  die "could not prepare profile '$PROFILE'."
+fi
+mv "$PROFILE_STAGE" "$FINAL_GENERATION" || die "could not stage profile '$PROFILE'."
+PROFILE_STAGE="$FINAL_GENERATION"
+trap '' INT TERM HUP
+if ! mv "$PROFILE_ROOT/current.tmp.$$" "$PROFILE_ROOT/current"; then
+  trap 'abort_installer 130' INT
+  trap 'abort_installer 143' TERM
+  trap 'abort_installer 129' HUP
+  rm -f "$PROFILE_ROOT/current.tmp.$$"
+  die "could not commit profile '$PROFILE'."
+fi
+PROFILE_STAGE=""
+SECRET_STAGED=0
+trap 'abort_installer 130' INT
+trap 'abort_installer 143' TERM
+trap 'abort_installer 129' HUP
+PROFILE_DIR="$FINAL_GENERATION"
+prune_profile_generations "$GENERATION" || warn "could not prune every retired profile generation."
+scrub_legacy_token "$HOME_DIR" || warn "could not remove every legacy credential artifact."
+ok "profile '$PROFILE' metadata committed"
+
+if [ "$UPDATE_KEY" -ne 1 ]; then
+  if ! printf '%s\n' "$PROFILE" > "$HOME_DIR/active-profile.tmp.$$" \
+    || ! mv "$HOME_DIR/active-profile.tmp.$$" "$HOME_DIR/active-profile"; then
+    rm -f "$HOME_DIR/active-profile.tmp.$$"
+    warn "could not select '$PROFILE' for future sessions. Use qbraid-code --use-profile $PROFILE."
+  fi
+fi
 
 printf '\n%sqbraid-code is ready.%s\n\n' "$bold$grn" "$rst"
 

@@ -10,14 +10,15 @@ HELPERS=$(awk '
 ' install.sh)
 [ -n "$HELPERS" ] || { echo '  FAIL installer profile helpers missing'; exit 1; }
 eval "$HELPERS"
-PRUNE_HELPER=$(awk '/^prune_profile_generations\(\)/,/^}/ { print }' install.sh)
+PRUNE_HELPER=$(awk '/^delete_retired_profile_secret\(\)/,/^# ------------------------------------------------------- 4\./ { if ($0 !~ /^# /) print }' install.sh)
 eval "$PRUNE_HELPER"
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 ROOT="$TMP/qc"
 export OS=linux
 mkdir -p "$ROOT/proxy-auth"
-printf 'QBRAID_CODE_BASE_URL=https://example.invalid\nQBRAID_CODE_TOKEN=legacy-token\n' > "$ROOT/env"
+cc tests/fake-proxy.c -o "$ROOT/cliproxyapi"
+printf 'QBRAID_CODE_BASE_URL=https://example.invalid\nQBRAID_CODE_PROXY_BIN=%s\nQBRAID_CODE_TOKEN=legacy-token\n' "$ROOT/cliproxyapi" > "$ROOT/env"
 printf 'legacy-cache\n' > "$ROOT/credits.cache"
 printf 'legacy-auth\n' > "$ROOT/proxy-auth/session"
 printf 'api-key: legacy-token\n' > "$ROOT/proxy-config.yaml"
@@ -50,7 +51,7 @@ fi
 scrub_legacy_token "$ROOT"
 if ! grep -q legacy-token "$ROOT/env" && grep -q QBRAID_CODE_BASE_URL "$ROOT/env" && [ ! -e "$ROOT/proxy-config.yaml" ]; then pass=$((pass + 1)); printf '  ok   committed migration scrubs legacy plaintext and proxy config\n'; else fail=$((fail + 1)); printf '  FAIL committed legacy scrub\n'; fi
 printf 'api-key: live-legacy\n' > "$ROOT/proxy-config.yaml"
-bash -c 'while :; do sleep 1; done' "$ROOT/proxy-config.yaml" & legacy_proxy=$!
+"$ROOT/cliproxyapi" -config "$ROOT/proxy-config.yaml" >/dev/null 2>&1 & legacy_proxy=$!
 printf '%s\n' "$legacy_proxy" > "$ROOT/proxy.pid"
 sleep 0.1; scrub_legacy_token "$ROOT"
 if [ -f "$ROOT/proxy-config.yaml" ]; then pass=$((pass + 1)); printf '  ok   live legacy proxy retains its watched config\n'; else fail=$((fail + 1)); printf '  FAIL live legacy proxy config was removed\n'; fi
