@@ -716,7 +716,11 @@ fi
 # still here, rather than surprising them mid-session.
 if [ -n "$TTY" ]; then
   if confirm "Sign in to the qBraid MCP now? (opens a browser)" y; then
-    claude mcp login "$MCP_NAME" \
+    # `claude mcp login` needs a real terminal to take the redirect URL. Under
+    # `curl … | bash` this script's stdin IS the pipe, so it must be handed the
+    # terminal explicitly — otherwise sign-in always fails with
+    # "stdin isn't a terminal".
+    claude mcp login "$MCP_NAME" < "$TTY" \
       || warn "MCP sign-in did not complete. Run \`claude mcp login $MCP_NAME\` later."
   else
     warn "skipped. Run \`claude mcp login $MCP_NAME\` when you want the qBraid tools."

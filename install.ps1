@@ -498,6 +498,8 @@ if ($LASTEXITCODE -eq 0) {
 # key above cannot authorize it. Do the browser sign-in now, while the user is
 # still here, rather than surprising them mid-session.
 if (Confirm-Step 'Sign in to the qBraid MCP now? (opens a browser)' 'y') {
+    # Unlike the piped bash path, `iex` keeps the console attached, so the
+    # OAuth prompt can read the redirect URL directly.
     claude mcp login $McpName
     if ($LASTEXITCODE -ne 0) { Warn "MCP sign-in did not complete. Run ``claude mcp login $McpName`` later." }
 } else {
