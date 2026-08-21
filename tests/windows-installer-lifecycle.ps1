@@ -90,7 +90,7 @@ exit $LASTEXITCODE
     $null = [Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]
     $vault = New-Object Windows.Security.Credentials.PasswordVault
 
-    $first = Invoke-TestInstaller @('-Profile', 'lifecycle-native') 'test-initial-secret'
+    $first = Invoke-TestInstaller -Arguments @('-Profile', 'lifecycle-native') -ApiKey 'test-initial-secret'
     if ($first.ExitCode -ne 0) { throw "initial native install failed: $($first.Output)" }
     $firstDir = Get-CurrentProfileDirectory $homeDir 'lifecycle-native'
     $firstGeneration = Split-Path $firstDir -Leaf
@@ -105,7 +105,7 @@ exit $LASTEXITCODE
     $staleProcess = Start-Process $staleExecutable -ArgumentList @('-config', "`"$staleConfig`"") -PassThru
     [IO.File]::WriteAllText((Join-Path $firstDir 'proxy.pid'), [string]$staleProcess.Id)
     $beforeStaleRejection = (Get-Content (Join-Path $homeDir 'profiles\lifecycle-native\current') -Raw).Trim()
-    $staleRejection = Invoke-TestInstaller @('-Profile', 'lifecycle-native', '-UpdateKey') 'test-stale-rejected-secret'
+    $staleRejection = Invoke-TestInstaller -Arguments @('-Profile', 'lifecycle-native', '-UpdateKey') -ApiKey 'test-stale-rejected-secret'
     $staleProcess.Refresh()
     if ($staleRejection.ExitCode -eq 0 -or $staleProcess.HasExited -or
         (Get-Content (Join-Path $homeDir 'profiles\lifecycle-native\current') -Raw).Trim() -ne $beforeStaleRejection) {
@@ -123,7 +123,7 @@ exit $LASTEXITCODE
     [IO.File]::WriteAllText($staleConfig, "port: 8320`n")
     $ownedStaleProcess = Start-Process (Join-Path $homeDir 'cliproxyapi.exe') -ArgumentList @('-config', "`"$staleConfig`"") -PassThru
     [IO.File]::WriteAllText((Join-Path $firstDir 'proxy.pid'), [string]$ownedStaleProcess.Id)
-    $rotated = Invoke-TestInstaller @('-Profile', 'lifecycle-native', '-UpdateKey') '' 'test-replacement-secret'
+    $rotated = Invoke-TestInstaller -Arguments @('-Profile', 'lifecycle-native', '-UpdateKey') -PromptKey 'test-replacement-secret'
     if ($rotated.ExitCode -ne 0) { throw "native rotation failed: $($rotated.Output)" }
     $ownedStaleProcess.Refresh()
     if (-not $ownedStaleProcess.HasExited) { Stop-Process -Id $ownedStaleProcess.Id -Force; throw 'installer did not stop an owned stale proxy process' }
@@ -139,11 +139,11 @@ exit $LASTEXITCODE
     if ($rotated.Output -match 'test-(initial|replacement|qbraidrc)-') { throw 'rotation printed a credential' }
 
     $beforeCross = (Get-Content (Join-Path $homeDir 'profiles\lifecycle-native\current') -Raw).Trim()
-    $cross = Invoke-TestInstaller @('-Profile', 'lifecycle-native', '-UpdateKey') 'test-cross-org'
+    $cross = Invoke-TestInstaller -Arguments @('-Profile', 'lifecycle-native', '-UpdateKey') -ApiKey 'test-cross-org'
     if ($cross.ExitCode -eq 0 -or $cross.Output -notmatch 'another organization') { throw "cross-organization rotation was not rejected: $($cross.Output)" }
     if ((Get-Content (Join-Path $homeDir 'profiles\lifecycle-native\current') -Raw).Trim() -ne $beforeCross) { throw 'cross-organization rejection changed the generation' }
 
-    $rollback = Invoke-TestInstaller @('-Profile', 'lifecycle-native', '-UpdateKey') 'test-post-stage-secret' '' -FailMcp
+    $rollback = Invoke-TestInstaller -Arguments @('-Profile', 'lifecycle-native', '-UpdateKey') -ApiKey 'test-post-stage-secret' -FailMcp
     if ($rollback.ExitCode -eq 0 -or $rollback.Output -notmatch 'could not register') { throw "post-stage failure was not reported: $($rollback.Output)" }
     if ((Get-Content (Join-Path $homeDir 'profiles\lifecycle-native\current') -Raw).Trim() -ne $beforeCross -or (Get-VaultPassword $rotatedRef) -ne 'test-replacement-secret') { throw 'post-stage failure changed the committed generation or secret' }
     $owned = @($vault.RetrieveAll() | Where-Object { $_.Resource -like 'qbraid-code:lifecycle-native:*' })
@@ -151,7 +151,7 @@ exit $LASTEXITCODE
     if ($rollback.Output -match 'test-post-stage-secret') { throw 'failed rotation printed its credential' }
 
     Remove-Item (Join-Path $rotatedDir 'organization-id') -Force
-    $missingOrg = Invoke-TestInstaller @('-Profile', 'lifecycle-native', '-UpdateKey') 'test-same-org-after-missing-id'
+    $missingOrg = Invoke-TestInstaller -Arguments @('-Profile', 'lifecycle-native', '-UpdateKey') -ApiKey 'test-same-org-after-missing-id'
     if ($missingOrg.ExitCode -eq 0 -or $missingOrg.Output -notmatch 'no verified organization ID') { throw 'rotation without the previous organization identity did not fail closed' }
 
     $junctionTarget = Join-Path $tmp 'junction-target'
@@ -162,7 +162,7 @@ exit $LASTEXITCODE
     if ($LASTEXITCODE -ne 0) { throw 'could not create installer junction fixture' }
     $env:QBRAID_CODE_HOME = $junctionHome
     $env:QBRAID_CODE_BIN_DIR = $junctionBin
-    $junctionInstall = Invoke-TestInstaller @('-Profile', 'junction-native') 'test-junction-secret'
+    $junctionInstall = Invoke-TestInstaller -Arguments @('-Profile', 'junction-native') -ApiKey 'test-junction-secret'
     if ($junctionInstall.ExitCode -eq 0 -or (Test-Path (Join-Path $junctionTarget '.qbraid-code-install'))) {
         throw "installer accepted a reparse-point custom home: $($junctionInstall.Output)"
     }
@@ -180,7 +180,7 @@ exit $LASTEXITCODE
     $env:QBRAID_CODE_HOME = $customHome
     $env:QBRAID_CODE_BIN_DIR = $customBin
     $env:QBRAID_CODE_MODEL = 'claude-opus-5'
-    $customMigration = Invoke-TestInstaller @('-Profile', 'custom-native') 'test-custom-secret'
+    $customMigration = Invoke-TestInstaller -Arguments @('-Profile', 'custom-native') -ApiKey 'test-custom-secret'
     if ($customMigration.ExitCode -ne 0 -or (Get-Content (Join-Path $customHome '.qbraid-code-install') -Raw).Trim() -ne 'qbraid-code' -or
         -not (Test-Path (Join-Path $customHome 'profiles\default\env')) -or -not (Test-Path (Join-Path $customHome 'profiles\default\proxy-template.yaml'))) {
         throw "pre-marker custom Windows migration failed: $($customMigration.Output)"
