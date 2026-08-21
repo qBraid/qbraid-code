@@ -443,17 +443,38 @@ ok "statusline installed to $HOME_DIR/statusline.sh"
 # Non-fatal throughout: Claude models work without any of this. If a step
 # fails, the install continues and `qbraid-code --model gpt-*` explains itself.
 say "GPT models"
+
+# The /model picker integration needs `claude-code.disable-cloaking-model-list`
+# (CLIProxyAPI >= 7.2.135-ish); an older binary would show the picker reversed
+# pseudo-model gibberish. Feature-detect on the binary itself, not a version
+# number.
+proxy_supports_picker() {
+  # grep -q exits at the first match, strings then dies of SIGPIPE, and
+  # pipefail would turn that into failure-on-success. Same class of bug as
+  # the json extractors; same cure.
+  (
+    set +o pipefail
+    strings "$1" 2>/dev/null | grep -q "disable-cloaking-model-list"
+  )
+}
+
 PROXY_BIN=""
-if command -v cliproxyapi >/dev/null 2>&1; then
-  PROXY_BIN="$(command -v cliproxyapi)"
-  ok "using existing $PROXY_BIN"
-elif [ -x "$HOME_DIR/cliproxyapi" ]; then
-  PROXY_BIN="$HOME_DIR/cliproxyapi"
-  ok "using existing $PROXY_BIN"
-elif [ "$OS" = darwin ] && command -v brew >/dev/null 2>&1; then
-  if brew install cliproxyapi >/dev/null 2>&1; then
-    PROXY_BIN="$(command -v cliproxyapi)"
-    ok "proxy installed via Homebrew"
+for cand in "$(command -v cliproxyapi 2>/dev/null || true)" "$HOME_DIR/cliproxyapi"; do
+  [ -n "$cand" ] && [ -x "$cand" ] || continue
+  if proxy_supports_picker "$cand"; then
+    PROXY_BIN="$cand"
+    ok "using existing $PROXY_BIN"
+    break
+  fi
+  warn "$cand is too old for the /model picker — upgrading"
+done
+if [ -z "$PROXY_BIN" ] && [ "$OS" = darwin ] && command -v brew >/dev/null 2>&1; then
+  if brew install cliproxyapi >/dev/null 2>&1 || brew upgrade cliproxyapi >/dev/null 2>&1; then
+    CAND="$(command -v cliproxyapi 2>/dev/null || true)"
+    if [ -n "$CAND" ] && proxy_supports_picker "$CAND"; then
+      PROXY_BIN="$CAND"
+      ok "proxy installed via Homebrew"
+    fi
   fi
 fi
 if [ -z "$PROXY_BIN" ]; then
@@ -465,7 +486,8 @@ if [ -z "$PROXY_BIN" ]; then
     PROXY_URL="https://github.com/$PROXY_REPO/releases/download/$TAG/CLIProxyAPI_${VER}_${OS}_${PROXY_ARCH}.tar.gz"
     PROXY_TMP=$(mktemp -d)
     if curl -fsSL -m 120 -o "$PROXY_TMP/cpa.tar.gz" "$PROXY_URL" 2>/dev/null \
-      && tar xzf "$PROXY_TMP/cpa.tar.gz" -C "$PROXY_TMP" cli-proxy-api 2>/dev/null; then
+      && tar xzf "$PROXY_TMP/cpa.tar.gz" -C "$PROXY_TMP" cli-proxy-api 2>/dev/null \
+      && proxy_supports_picker "$PROXY_TMP/cli-proxy-api"; then
       install -m 0755 "$PROXY_TMP/cli-proxy-api" "$HOME_DIR/cliproxyapi"
       PROXY_BIN="$HOME_DIR/cliproxyapi"
       ok "proxy installed to $PROXY_BIN"
@@ -510,6 +532,11 @@ remote-management:
   allow-remote: false
   disable-control-panel: true
 debug: false
+# Model-list cloaking rewrites ids into reversed pseudo-claude names so they
+# pass Claude Code's discovery filter — the picker then shows gibberish. Our
+# anthropic-compat/ aliases pass the filter with readable names instead.
+claude-code:
+  disable-cloaking-model-list: true
 claude-api-key:
   - api-key: "$API_KEY"
     base-url: "$GATEWAY_URL"
@@ -529,7 +556,13 @@ openai-compatibility:
 PEOF
       printf '%s\n' "$GPT_MODELS" | while IFS= read -r gm; do
         [ -n "$gm" ] || continue
+        # Two aliases per GPT model: the plain id for the command line, and a
+        # prefixed one containing "anthropic" so Claude Code's /model picker
+        # discovery filter (which keeps only ids containing claude|anthropic)
+        # shows it. The alias IS the inference mapping — selecting the
+        # prefixed row routes to the same upstream model.
         printf '      - name: "%s"\n        alias: "%s"\n' "$gm" "$gm"
+        printf '      - name: "%s"\n        alias: "anthropic-compat/%s"\n' "$gm" "$gm"
       done
     } > "$HOME_DIR/proxy-config.yaml"
     chmod 600 "$HOME_DIR/proxy-config.yaml"
