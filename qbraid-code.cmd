@@ -55,15 +55,21 @@ for %%a in (%*) do (
 
 set "RUNBASE=%QBRAID_CODE_BASE_URL%"
 set "RUNTOKEN=%QBRAID_CODE_TOKEN%"
-if /i not "%RUNMODEL:~0,4%"=="gpt-" goto :direct
-rem GPT route: the loopback proxy translates Anthropic Messages to the
-rem gateway's OpenAI surface. Azure caps tools at 128; with many MCP servers
-rem use --strict-mcp-config.
+rem Unified route: the proxy serves every model on one endpoint (Claude
+rem passthrough, GPT translated). Fall back to the direct gateway for Claude
+rem models when the proxy is unavailable; GPT models require it.
+if not exist "%QC_HOME%\proxy-config.yaml" goto :noproxy
 powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1" ensure
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto :noproxy
 set /p RUNTOKEN=<"%QC_HOME%\proxy.key"
 set "RUNBASE=http://127.0.0.1:8320"
-:direct
+goto :routed
+:noproxy
+if /i "%RUNMODEL:~0,4%"=="gpt-" (
+  echo qbraid-code: GPT models need the local proxy. Re-run: irm https://qbraid.com/code.ps1 ^| iex 1>&2
+  exit /b 1
+)
+:routed
 
 where claude >nul 2>&1
 if errorlevel 1 (

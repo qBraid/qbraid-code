@@ -195,21 +195,34 @@ command -v claude >/dev/null 2>&1 || {
 RUN_MODEL=$(requested_model "$@")
 RUN_BASE="$BASE_URL"
 RUN_TOKEN="$TOKEN"
-case "$RUN_MODEL" in
-  gpt-*)
-    # GPT route: loopback proxy translates Anthropic Messages to the
-    # gateway's OpenAI surface. Azure caps `tools` at 128 — with many MCP
-    # servers Claude Code exceeds it; --strict-mcp-config avoids that.
-    start_proxy || exit 1
+if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] && [ -s "$HOME_DIR/proxy-config.yaml" ]; then
+  # Unified route: the proxy serves EVERY model on one endpoint — Claude
+  # models pass through to the Anthropic surface untouched, GPT models are
+  # translated to the OpenAI surface — so /v1/models lists all of them and
+  # `/model <name>` works for any of them mid-session. Azure caps `tools` at
+  # 128 for GPT models; with many MCP servers use --strict-mcp-config.
+  if start_proxy; then
     RUN_BASE="$PROXY_URL"
     RUN_TOKEN=$(cat "$HOME_DIR/proxy.key")
-    ;;
-esac
+  else
+    case "$RUN_MODEL" in
+      gpt-*) exit 1 ;;  # start_proxy already explained
+      *) echo "qbraid-code: proxy unavailable — using the gateway directly (Claude models only)." >&2 ;;
+    esac
+  fi
+else
+  case "$RUN_MODEL" in
+    gpt-*)
+      echo "qbraid-code: GPT models need the local proxy, which is not installed." >&2
+      echo "Re-run the installer: curl -fsSL https://qbraid.com/code.sh | bash" >&2
+      exit 1 ;;
+  esac
+fi
 
-# ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which the gateway
-# accepts. ANTHROPIC_API_KEY would work too, but it makes Claude Code ask the
-# user to approve a custom API key on first run — a prompt with no good answer
-# for someone who just wants to start working.
+# ANTHROPIC_AUTH_TOKEN sends `Authorization: Bearer <key>`, which both the
+# gateway and the proxy accept. ANTHROPIC_API_KEY would work too, but it makes
+# Claude Code ask the user to approve a custom API key on first run — a prompt
+# with no good answer for someone who just wants to start working.
 #
 # MAX_THINKING_TOKENS=0: recent Claude Code sends `thinking: {type: "adaptive"}`,
 # which the gateway's Anthropic surface rejects (it accepts enabled|disabled —
