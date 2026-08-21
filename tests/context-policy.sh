@@ -30,8 +30,6 @@ future-400k	400000
 EOF
 cat > "$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
-last="${!#:-}"
-case "$last" in http://127.0.0.1:*/) exec /usr/bin/curl "$@" ;; esac
 out=""; status=0
 while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w) status=1; shift 2;; --config|-m) shift 2;; *) shift;; esac; done
 [ -z "$out" ] || printf '{}' > "$out"

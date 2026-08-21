@@ -87,11 +87,14 @@ echo args=%*
     $list = (& cmd /c (Join-Path $root 'qbraid-code.cmd') --profiles) -join "`n"
     if ($list -notmatch '\* beta' -or $list -notmatch 'Beta Lab') { throw "profile list failed: $list" }
 
+    $ErrorActionPreference = 'Continue'
     & cmd /c (Join-Path $root 'qbraid-code.cmd') --global *> $null
-    if ($LASTEXITCODE -eq 0) { throw 'unsafe global mode was accepted' }
-
+    $globalExit = $LASTEXITCODE
     & cmd /c (Join-Path $root 'qbraid-code.cmd') --profile alpha --resume *> $null
-    if ($LASTEXITCODE -eq 0) { throw 'cross-profile resume was accepted without confirmation' }
+    $resumeExit = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if ($globalExit -eq 0) { throw 'unsafe global mode was accepted' }
+    if ($resumeExit -eq 0) { throw 'cross-profile resume was accepted without confirmation' }
     $out = (& cmd /c (Join-Path $root 'qbraid-code.cmd') --profile alpha --allow-profile-resume --resume session-id) -join "`n"
     if ($out -match 'token=token-alpha' -or $out -notmatch '--resume session-id') { throw "confirmed resume failed: $out" }
 
