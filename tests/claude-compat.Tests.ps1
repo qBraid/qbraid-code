@@ -215,3 +215,4 @@ Remove-Item Function:\claude
 
 Write-Host "`n$($script:Passed) passed, $($script:Failed) failed"
 if ($script:Failed -ne 0) { exit 1 }
+exit 0
