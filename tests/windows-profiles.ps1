@@ -75,16 +75,16 @@ echo args=%*
     $env:Path = "$bin;$env:Path"
     $env:CAPTURE_PROXY_CONFIG = Join-Path $tmp 'runtime.yaml'
 
-    $out = & cmd /c (Join-Path $root 'qbraid-code.cmd') -p hello
+    $out = (& cmd /c (Join-Path $root 'qbraid-code.cmd') -p hello) -join "`n"
     if ($out -match 'token=token-alpha' -or $out -notmatch 'model=claude-opus-5\[1m\]' -or $out -notmatch 'args=-p hello' -or $out -notmatch '--setting-sources user') { throw "active binding failed: $out" }
     if ((Get-Content (Join-Path $qcHome 'env') -Raw) -match 'legacy-root-token' -or (Test-Path (Join-Path $qcHome 'proxy-config.yaml'))) { throw 'legacy plaintext artifacts were not scavenged' }
     $runtimeYaml = Get-Content $env:CAPTURE_PROXY_CONFIG -Raw
     if (-not $runtimeYaml.Contains($unicodeChar) -or $runtimeYaml -notmatch 'auth-dir: "[^"]*qbraid profiles [^"]*/runtime\.') { throw "runtime YAML path encoding failed: $runtimeYaml" }
-    $out = & cmd /c (Join-Path $root 'qbraid-code.cmd') --profile beta -p hello
+    $out = (& cmd /c (Join-Path $root 'qbraid-code.cmd') --profile beta -p hello) -join "`n"
     if ($out -match 'token=token-beta' -or $out -notmatch 'context=200000' -or $out -match '--profile') { throw "explicit binding failed: $out" }
     & cmd /c (Join-Path $root 'qbraid-code.cmd') --use-profile beta | Out-Null
     if ((Get-Content (Join-Path $qcHome 'active-profile') -Raw).Trim() -ne 'beta') { throw 'atomic selection failed' }
-    $list = & cmd /c (Join-Path $root 'qbraid-code.cmd') --profiles
+    $list = (& cmd /c (Join-Path $root 'qbraid-code.cmd') --profiles) -join "`n"
     if ($list -notmatch '\* beta' -or $list -notmatch 'Beta Lab') { throw "profile list failed: $list" }
 
     & cmd /c (Join-Path $root 'qbraid-code.cmd') --global *> $null
@@ -92,13 +92,13 @@ echo args=%*
 
     & cmd /c (Join-Path $root 'qbraid-code.cmd') --profile alpha --resume *> $null
     if ($LASTEXITCODE -eq 0) { throw 'cross-profile resume was accepted without confirmation' }
-    $out = & cmd /c (Join-Path $root 'qbraid-code.cmd') --profile alpha --allow-profile-resume --resume session-id
+    $out = (& cmd /c (Join-Path $root 'qbraid-code.cmd') --profile alpha --allow-profile-resume --resume session-id) -join "`n"
     if ($out -match 'token=token-alpha' -or $out -notmatch '--resume session-id') { throw "confirmed resume failed: $out" }
 
     '19' | Set-Content (Join-Path $beta 'credits.cache') -Encoding ASCII
     [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() | Set-Content (Join-Path $beta 'credits.updated') -Encoding ASCII
     $env:QBRAID_CODE_PROFILE_HOME = $beta
-    $status = '{"model":{"display_name":"Haiku"},"workspace":{"current_dir":"C:\\tmp"}}' | & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'statusline.ps1')
+    $status = ('{"model":{"display_name":"Haiku"},"workspace":{"current_dir":"C:\\tmp"}}' | & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'statusline.ps1')) -join "`n"
     if ($status -notmatch 'qBraid' -or $status -notmatch 'Beta Lab' -or $status -notmatch '19') { throw "status binding failed: $status" }
 
     $sources = Get-Content (Join-Path $root 'qbraid-code.cmd'), (Join-Path $root 'install.ps1') -Raw

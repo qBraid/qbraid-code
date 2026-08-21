@@ -206,7 +206,7 @@ prepare_proxy_runtime() {
   chmod 700 "$HOME_DIR/ports" 2>/dev/null || true
   candidate=$PROXY_PORT
   while [ "$candidate" -le 8999 ]; do
-    if { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then candidate=$((candidate + 1)); continue; fi
+    if { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; } || { command -v nc >/dev/null 2>&1 && nc -z -w 1 127.0.0.1 "$candidate" >/dev/null 2>&1; } || (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then candidate=$((candidate + 1)); continue; fi
     if mkdir "$HOME_DIR/ports/$candidate" 2>/dev/null; then
       printf '%s\n' "$$" > "$HOME_DIR/ports/$candidate/pid"
       PORT_LOCK="$HOME_DIR/ports/$candidate"
