@@ -32,6 +32,29 @@ That is all. The installer:
 
 Re-running it is safe.
 
+### Claude Code compatibility
+
+qbraid-code currently supports Claude Code **2.1.186 or newer** and is tested
+through **2.1.238**. A newer version is never blocked or downgraded; the
+installer only notes that it is newer than the latest version covered by CI.
+
+If an existing Claude Code is too old or is missing the HTTP MCP commands that
+qbraid-code needs, the installer offers to move it to Anthropic's `stable`
+channel. It always asks before changing an existing installation. Set
+`QBRAID_CODE_CLAUDE_POLICY` to choose the behavior explicitly:
+
+| Value | Behavior |
+|---|---|
+| `prompt` | Ask before installing or upgrading (default with a terminal) |
+| `upgrade` | Install or upgrade to the stable channel without prompting |
+| `fail` | Stop rather than changing Claude Code (default without a terminal) |
+| `continue` | Keep an unsupported version and skip or degrade unavailable features |
+
+The installer checks the actual CLI capabilities as well as its version. In
+particular, an older release without `claude mcp login` can still finish setup:
+qbraid-code registers the server when possible and directs you to Claude Code's
+interactive `/mcp` menu for authentication.
+
 ## Use
 
 ```bash
@@ -118,6 +141,9 @@ setup, while you are still there. If you skipped it:
 claude mcp login qbraid
 ```
 
+On Claude Code versions without that command, start Claude Code, run `/mcp`,
+select `qbraid`, and choose **Authenticate**.
+
 ## Layout
 
 | Path | What |
@@ -144,6 +170,10 @@ and re-run the installer.
 
 **`qbraid-code: command not found`** — `~/.local/bin` is not on your `PATH`. The
 installer prints the line to add. On Windows, open a new terminal first.
+
+**`unknown command 'login'`** — your Claude Code predates the MCP login command.
+Run `claude update`, re-run the qbraid-code installer and accept its stable-channel
+upgrade, or authenticate from Claude Code's `/mcp` menu.
 
 **Wrong organization** — credits come from the organization the key belongs to.
 Create a key under the organization you want, then re-run the installer.

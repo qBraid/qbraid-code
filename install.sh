@@ -26,6 +26,8 @@ PROXY_PORT="${QBRAID_CODE_PROXY_PORT:-8320}"
 PROXY_REPO="router-for-me/CLIProxyAPI"
 MCP_URL="https://mcp.qbraid.com/mcp"
 KEYS_URL="https://account.qbraid.com/account/api-keys"
+CLAUDE_MIN_VERSION="2.1.186"
+CLAUDE_TESTED_MAX="2.1.238"
 
 # Companion files are fetched from qbraid.com first. That is the whole point
 # of the proxy: on a campus network that blocks raw.githubusercontent.com, an
@@ -57,6 +59,8 @@ Environment:
   QBRAID_CODE_MODEL     use this model instead of prompting
   QBRAID_CODE_HOME      config directory (default ~/.qbraid-code)
   QBRAID_CODE_BIN_DIR   install directory (default ~/.local/bin)
+  QBRAID_CODE_CLAUDE_POLICY
+                         prompt, upgrade, fail, or continue
 EOF
       exit 0 ;;
     *) ;;
@@ -121,6 +125,171 @@ confirm() { # confirm <question> <default y|n> -> 0 if yes
   [ "$reply" = y ] || [ "$reply" = yes ]
 }
 
+# ------------------------------------------------------ Claude compatibility
+
+parse_claude_version() { # parse_claude_version <claude --version output>
+  (
+    set +o pipefail
+    printf '%s' "$1" | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1
+  ) || true
+}
+
+compare_versions() { # compare_versions <left> <right> -> -1, 0, or 1
+  awk -v left="$1" -v right="$2" 'BEGIN {
+    split(left, l, "."); split(right, r, ".")
+    for (i = 1; i <= 3; i++) {
+      if ((l[i] + 0) < (r[i] + 0)) { print -1; exit }
+      if ((l[i] + 0) > (r[i] + 0)) { print 1; exit }
+    }
+    print 0
+  }'
+}
+
+claude_version_status() { # claude_version_status <version>
+  local version="$1" compared
+  [ -n "$version" ] || { printf 'unknown'; return; }
+  compared=$(compare_versions "$version" "$CLAUDE_MIN_VERSION")
+  [ "$compared" -ge 0 ] || { printf 'below-minimum'; return; }
+  compared=$(compare_versions "$version" "$CLAUDE_TESTED_MAX")
+  [ "$compared" -le 0 ] && printf 'tested' || printf 'newer-than-tested'
+}
+
+claude_policy_action() { # claude_policy_action <policy> <interactive yes|no>
+  case "$1" in
+    upgrade|fail|continue) printf '%s' "$1" ;;
+    prompt) [ "$2" = yes ] && printf 'prompt' || printf 'fail' ;;
+    *) printf 'invalid' ;;
+  esac
+}
+
+claude_supports_mcp_command() { # claude_supports_mcp_command <command>
+  local help
+  help=$(claude mcp --help 2>/dev/null || true)
+  printf '%s\n' "$help" | grep -Eq "^[[:space:]]+$1([[:space:]]|$)"
+}
+
+claude_supports_mcp_http() {
+  local help
+  help=$(claude mcp add --help 2>/dev/null || true)
+  printf '%s\n' "$help" | grep -Eq -- '--transport.*http'
+}
+
+claude_supports_mcp_user_scope() {
+  local help
+  help=$(claude mcp add --help 2>/dev/null || true)
+  printf '%s\n' "$help" | grep -Eq -- '--scope.*user'
+}
+
+install_claude_stable() {
+  warn "installing Claude Code from Anthropic's stable channel"
+  curl -fsSL https://claude.ai/install.sh | bash -s stable \
+    || die "Claude Code stable-channel install failed. See https://claude.com/product/claude-code"
+  export PATH="$HOME/.local/bin:$PATH"
+  hash -r
+  command -v claude >/dev/null 2>&1 \
+    || die "Claude Code installed but \`claude\` is not on PATH."
+}
+
+refresh_claude_state() {
+  local output
+  output=$(claude --version 2>/dev/null || true)
+  CLAUDE_VERSION=$(parse_claude_version "$output")
+  CLAUDE_VERSION_STATUS=$(claude_version_status "$CLAUDE_VERSION")
+  CLAUDE_MCP_ADD=0; CLAUDE_MCP_GET=0; CLAUDE_MCP_LOGIN=0
+  CLAUDE_MCP_HTTP=0; CLAUDE_MCP_USER_SCOPE=0
+  claude_supports_mcp_command add && CLAUDE_MCP_ADD=1
+  claude_supports_mcp_command get && CLAUDE_MCP_GET=1
+  claude_supports_mcp_command login && CLAUDE_MCP_LOGIN=1
+  claude_supports_mcp_http && CLAUDE_MCP_HTTP=1
+  claude_supports_mcp_user_scope && CLAUDE_MCP_USER_SCOPE=1
+  return 0
+}
+
+claude_required_capabilities_present() {
+  [ "$CLAUDE_MCP_ADD" = 1 ] && [ "$CLAUDE_MCP_GET" = 1 ] \
+    && [ "$CLAUDE_MCP_HTTP" = 1 ] && [ "$CLAUDE_MCP_USER_SCOPE" = 1 ]
+}
+
+ensure_claude_compatible() {
+  local policy="${QBRAID_CODE_CLAUDE_POLICY:-prompt}" interactive=no action issue="" upgraded=0
+  [ -n "$TTY" ] && interactive=yes
+  case "$policy" in
+    prompt|upgrade|fail|continue) ;;
+    *) die "QBRAID_CODE_CLAUDE_POLICY must be prompt, upgrade, fail, or continue." ;;
+  esac
+
+  if ! command -v claude >/dev/null 2>&1; then
+    action=$(claude_policy_action "$policy" "$interactive")
+    case "$action" in
+      upgrade) install_claude_stable ;;
+      prompt)
+        confirm "Claude Code is not installed. Install the stable channel now?" y \
+          && install_claude_stable \
+          || die "Claude Code is required. Re-run with QBRAID_CODE_CLAUDE_POLICY=upgrade to install it."
+        ;;
+      *) die "Claude Code is not installed. Re-run with QBRAID_CODE_CLAUDE_POLICY=upgrade." ;;
+    esac
+  fi
+
+  refresh_claude_state
+  case "$CLAUDE_VERSION_STATUS" in
+    unknown) issue="could not determine its version" ;;
+    below-minimum) issue="version $CLAUDE_VERSION is below the supported minimum $CLAUDE_MIN_VERSION" ;;
+  esac
+  if ! claude_required_capabilities_present; then
+    [ -n "$issue" ] && issue="$issue; "
+    issue="${issue}required HTTP MCP commands are unavailable"
+  fi
+
+  if [ -n "$issue" ]; then
+    action=$(claude_policy_action "$policy" "$interactive")
+    if [ "$CLAUDE_VERSION_STATUS" = newer-than-tested ]; then
+      case "$action" in
+        continue|prompt)
+          warn "Claude Code $CLAUDE_VERSION is newer than tested and lacks required capabilities; refusing to downgrade it and continuing with reduced compatibility."
+          ;;
+        *)
+          die "Claude Code $CLAUDE_VERSION is newer than tested and lacks required capabilities. Refusing to downgrade it; set QBRAID_CODE_CLAUDE_POLICY=continue to skip unavailable features."
+          ;;
+      esac
+      action=handled
+    fi
+    case "$action" in
+      upgrade)
+        warn "the installed Claude Code is incompatible: $issue"
+        install_claude_stable; upgraded=1
+        ;;
+      prompt)
+        warn "the installed Claude Code is incompatible: $issue"
+        if confirm "Upgrade Claude Code to the stable channel now?" y; then
+          install_claude_stable; upgraded=1
+        else
+          warn "continuing with reduced compatibility at your request"
+        fi
+        ;;
+      continue) warn "continuing with an unsupported Claude Code: $issue" ;;
+      fail)
+        die "the installed Claude Code is incompatible: $issue. Upgrade it, or explicitly set QBRAID_CODE_CLAUDE_POLICY=continue."
+        ;;
+      handled) ;;
+    esac
+  fi
+
+  if [ "$upgraded" = 1 ]; then
+    refresh_claude_state
+    [ "$CLAUDE_VERSION_STATUS" != unknown ] \
+      && [ "$CLAUDE_VERSION_STATUS" != below-minimum ] \
+      && claude_required_capabilities_present \
+      || die "Claude Code was upgraded, but version $CLAUDE_MIN_VERSION+ with HTTP MCP support is still unavailable."
+  fi
+
+  case "$CLAUDE_VERSION_STATUS" in
+    tested) ok "Claude Code $CLAUDE_VERSION" ;;
+    newer-than-tested) warn "Claude Code $CLAUDE_VERSION is newer than the latest tested version ($CLAUDE_TESTED_MAX); continuing without downgrading." ;;
+    *) warn "Claude Code ${CLAUDE_VERSION:-present} remains outside the supported range; unavailable features will be skipped." ;;
+  esac
+}
+
 # ---------------------------------------------------------------- 1. platform
 
 case "$(uname -s)" in
@@ -151,19 +320,7 @@ have_python() {
 # ------------------------------------------------------------ 2. claude code
 
 say "Claude Code"
-if command -v claude >/dev/null 2>&1; then
-  ok "already installed ($(claude --version 2>/dev/null || echo present))"
-else
-  warn "not installed — installing"
-  # Anthropic's official installer: a native binary into ~/.local/bin.
-  # No Node.js and no administrator rights required.
-  curl -fsSL https://claude.ai/install.sh | bash \
-    || die "Claude Code install failed. See https://claude.com/product/claude-code"
-  export PATH="$HOME/.local/bin:$PATH"
-  command -v claude >/dev/null 2>&1 \
-    || die "Claude Code installed but \`claude\` is not on PATH."
-  ok "installed"
-fi
+ensure_claude_compatible
 
 # ------------------------------------------------------------- 3. credential
 
@@ -715,18 +872,29 @@ fi
 # ------------------------------------------------------------------- 10. mcp
 
 say "qBraid MCP"
-if claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
+MCP_REGISTERED=0
+if ! claude_required_capabilities_present; then
+  warn "this Claude Code version cannot register an HTTP MCP server from the command line."
+  warn "Start Claude Code, run /mcp, and add $MCP_URL manually; or upgrade Claude Code."
+elif claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
+  MCP_REGISTERED=1
   ok "already registered"
 else
   claude mcp add --transport http "$MCP_NAME" "$MCP_URL" --scope user >/dev/null \
     || die "could not register the qBraid MCP server."
+  MCP_REGISTERED=1
   ok "registered $MCP_URL"
 fi
 
 # The MCP endpoint is JWT-only (OAuth + dynamic client registration): the API
 # key above cannot authorize it. Do the browser sign-in now, while the user is
 # still here, rather than surprising them mid-session.
-if [ -n "$TTY" ]; then
+if [ "$MCP_REGISTERED" != 1 ]; then
+  warn "MCP sign-in was skipped because registration is incomplete."
+elif [ "$CLAUDE_MCP_LOGIN" != 1 ]; then
+  warn "this Claude Code version authenticates MCP servers through its interactive menu."
+  warn "Start Claude Code, run /mcp, select '$MCP_NAME', and choose Authenticate."
+elif [ -n "$TTY" ]; then
   if confirm "Sign in to the qBraid MCP now? (opens a browser)" y; then
     # `claude mcp login` needs a real terminal to take the redirect URL. Under
     # `curl … | bash` this script's stdin IS the pipe, so it must be handed the

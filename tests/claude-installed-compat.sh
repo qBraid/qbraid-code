@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Smoke-check a real Claude Code release installed by the CI version matrix.
+set -euo pipefail
+
+version=$(claude --version)
+printf 'claude: %s\n' "$version"
+
+help=$(claude mcp --help)
+for command in add get login; do
+  printf '%s\n' "$help" | grep -Eq "^[[:space:]]+$command([[:space:]]|$)" || {
+    printf 'missing required mcp command: %s\n' "$command" >&2
+    exit 1
+  }
+done
+
+add_help=$(claude mcp add --help)
+printf '%s\n' "$add_help" | grep -Eq -- '--transport.*http' || {
+  printf 'mcp add does not advertise HTTP transport\n' >&2
+  exit 1
+}
+printf '%s\n' "$add_help" | grep -Eq -- '--scope.*user' || {
+  printf 'mcp add does not advertise user scope\n' >&2
+  exit 1
+}
+
+printf 'Claude Code MCP compatibility checks passed\n'

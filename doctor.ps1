@@ -23,14 +23,68 @@ $apiBase = $settings['QBRAID_CODE_API_BASE']
 $baseUrl = $settings['QBRAID_CODE_BASE_URL']
 $token   = $settings['QBRAID_CODE_TOKEN']
 $model   = $settings['QBRAID_CODE_MODEL']
+$claudeMinVersion = '2.1.186'
+$claudeTestedMax  = '2.1.238'
 
+function ConvertFrom-ClaudeVersionString {
+    param([string]$Text)
+    if ($Text -match '(\d+\.\d+\.\d+)') { return $Matches[1] }
+    return $null
+}
+
+function Test-ClaudeMcpCommand {
+    param([string]$Command)
+    $help = (& claude mcp --help 2>$null | Out-String)
+    return $help -match "(?m)^\s+$([regex]::Escape($Command))(?:\s|$)"
+}
+
+function Test-ClaudeMcpHttp {
+    $help = (& claude mcp add --help 2>$null | Out-String)
+    return $help -match '(?s)--transport.*\bhttp\b'
+}
+
+function Test-ClaudeMcpUserScope {
+    $help = (& claude mcp add --help 2>$null | Out-String)
+    return $help -match '(?s)--scope.*\buser\b'
+}
+
+$claudePresent = $false
+$claudeVersion = $null
+$mcpAdd = $false
+$mcpGet = $false
+$mcpLogin = $false
+$mcpHttp = $false
+$mcpUserScope = $false
 if (Get-Command claude -ErrorAction SilentlyContinue) {
+    $claudePresent = $true
     $version = (& claude --version 2>$null)
     if (-not $version) { $version = 'present' }
     Write-Host "claude:   $version"
+    $claudeVersion = ConvertFrom-ClaudeVersionString ($version | Out-String)
+    $mcpAdd = Test-ClaudeMcpCommand 'add'
+    $mcpGet = Test-ClaudeMcpCommand 'get'
+    $mcpLogin = Test-ClaudeMcpCommand 'login'
+    $mcpHttp = Test-ClaudeMcpHttp
+    $mcpUserScope = Test-ClaudeMcpUserScope
 } else {
     Write-Host 'claude:   NOT INSTALLED'
 }
+if (-not $claudeVersion) {
+    Write-Host "claude-min: UNKNOWN (requires $claudeMinVersion+)"
+    Write-Host 'claude-tested: unknown'
+} elseif ([version]$claudeVersion -lt [version]$claudeMinVersion) {
+    Write-Host "claude-min: FAIL (requires $claudeMinVersion+, found $claudeVersion)"
+    Write-Host 'claude-tested: unsupported'
+} elseif ([version]$claudeVersion -gt [version]$claudeTestedMax) {
+    Write-Host "claude-min: PASS (requires $claudeMinVersion+)"
+    Write-Host "claude-tested: NEWER than tested $claudeTestedMax (not blocked)"
+} else {
+    Write-Host "claude-min: PASS (requires $claudeMinVersion+)"
+    Write-Host "claude-tested: within tested range through $claudeTestedMax"
+}
+$claudePolicy = if ($env:QBRAID_CODE_CLAUDE_POLICY) { $env:QBRAID_CODE_CLAUDE_POLICY } else { 'prompt' }
+Write-Host "claude-policy: $claudePolicy"
+Write-Host "capabilities: mcp-add=$($mcpAdd.ToString().ToLower()) mcp-get=$($mcpGet.ToString().ToLower()) mcp-login=$($mcpLogin.ToString().ToLower()) mcp-http=$($mcpHttp.ToString().ToLower()) mcp-user-scope=$($mcpUserScope.ToString().ToLower())"
 
 # Separate transport failure from rejection. Reporting "REJECTED" for a dropped
 # connection sent people off to make a new key for no reason.
@@ -64,11 +118,19 @@ try {
     Write-Host 'gateway:  UNREACHABLE'
 }
 
-& claude mcp get qbraid *> $null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "mcp:      registered (run 'claude mcp login qbraid' if tools are missing)"
+if (-not $claudePresent -or -not $mcpGet) {
+    Write-Host 'mcp:      UNAVAILABLE - upgrade Claude Code or configure it through /mcp'
 } else {
-    Write-Host 'mcp:      NOT REGISTERED'
+    & claude mcp get qbraid *> $null
+    if ($LASTEXITCODE -eq 0) {
+        if ($mcpLogin) {
+            Write-Host "mcp:      registered (run 'claude mcp login qbraid' if tools are missing)"
+        } else {
+            Write-Host 'mcp:      registered (run /mcp inside Claude Code to authenticate)'
+        }
+    } else {
+        Write-Host 'mcp:      NOT REGISTERED'
+    }
 }
 
 Write-Host "model:    $model"

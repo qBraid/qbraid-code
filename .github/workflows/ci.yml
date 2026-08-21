@@ -18,7 +18,7 @@ jobs:
         run: brew install shellcheck
 
       - name: shellcheck
-        run: shellcheck -S warning install.sh qbraid-code statusline.sh tests/statusline.sh tests/extractors.sh tests/model-routing.sh
+        run: shellcheck -S warning install.sh qbraid-code statusline.sh tests/statusline.sh tests/extractors.sh tests/model-routing.sh tests/claude-compat.sh tests/claude-policy-flow.sh tests/claude-installed-compat.sh tests/doctor.sh
 
       - name: syntax
         run: |
@@ -34,6 +34,14 @@ jobs:
 
       - name: model routing tests
         run: tests/model-routing.sh
+
+      - name: Claude compatibility policy tests
+        run: |
+          tests/claude-compat.sh
+          tests/claude-policy-flow.sh
+
+      - name: doctor compatibility tests
+        run: tests/doctor.sh
 
       - name: installer --help does not touch the machine
         run: bash install.sh --help
@@ -62,6 +70,10 @@ jobs:
             "parsed $($f.Name)"
           }
 
+      - name: Claude compatibility policy tests
+        shell: pwsh
+        run: ./tests/claude-compat.Tests.ps1
+
       - name: batch launcher is CRLF and BOM-free
         shell: pwsh
         run: |
@@ -81,3 +93,25 @@ jobs:
           rem `echo` does not reset ERRORLEVEL in cmd, so the expected 1 would
           rem otherwise leak out and fail the step.
           exit /b 0
+
+  claude-compat:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: '2.1.186'
+            experimental: false
+          - release: stable
+            experimental: false
+          - release: latest
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code ${{ matrix.release }}
+        run: curl -fsSL https://claude.ai/install.sh | bash -s "${{ matrix.release }}"
+      - name: Check installed CLI capabilities
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          tests/claude-installed-compat.sh

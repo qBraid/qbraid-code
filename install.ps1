@@ -30,6 +30,8 @@ $GatewayUrl  = "$ApiBase/ai"
 $McpName     = 'qbraid'
 $McpUrl      = 'https://mcp.qbraid.com/mcp'
 $KeysUrl     = 'https://account.qbraid.com/account/api-keys'
+$script:ClaudeMinVersion = '2.1.186'
+$script:ClaudeTestedMax  = '2.1.238'
 $SiteBase    = 'https://qbraid.com/code'
 $RawBase     = 'https://raw.githubusercontent.com/qBraid/qbraid-code/main'
 $GhContents  = '/repos/qBraid/qbraid-code/contents'
@@ -43,12 +45,17 @@ $ClaudeJson = Join-Path $env:USERPROFILE '.claude.json'
 function Say  { param($m) Write-Host "==> $m" -ForegroundColor White }
 function Ok   { param($m) Write-Host "  + $m" -ForegroundColor Green }
 function Warn { param($m) Write-Host "  ! $m" -ForegroundColor Yellow }
+function Test-InteractiveConsole {
+    try { return -not [Console]::IsInputRedirected } catch { return $false }
+}
 function Die {
     param($m)
     Write-Host "`nerror: $m" -ForegroundColor Red
     # Under `irm | iex` in a fresh window, exiting closes the window with the
     # message still on screen for a fraction of a second. Hold it open.
-    if ($Host.UI.RawUI) { try { Read-Host 'Press Enter to close' | Out-Null } catch { } }
+    if ((Test-InteractiveConsole) -and $Host.UI.RawUI) {
+        try { Read-Host 'Press Enter to close' | Out-Null } catch { }
+    }
     exit 1
 }
 
@@ -70,6 +77,177 @@ function Confirm-Step {
     return ($reply -eq 'y' -or $reply -eq 'yes')
 }
 
+# ------------------------------------------------------ Claude compatibility
+
+function ConvertFrom-ClaudeVersionString {
+    param([string]$Text)
+    if ($Text -match '(\d+\.\d+\.\d+)') { return $Matches[1] }
+    return $null
+}
+
+function Compare-ClaudeVersion {
+    param([string]$Left, [string]$Right)
+    return ([version]$Left).CompareTo([version]$Right)
+}
+
+function Get-ClaudeVersionStatus {
+    param([string]$Version)
+    if (-not $Version) { return 'unknown' }
+    if ((Compare-ClaudeVersion $Version $script:ClaudeMinVersion) -lt 0) {
+        return 'below-minimum'
+    }
+    if ((Compare-ClaudeVersion $Version $script:ClaudeTestedMax) -gt 0) {
+        return 'newer-than-tested'
+    }
+    return 'tested'
+}
+
+function Get-ClaudePolicyAction {
+    param([string]$Policy, [bool]$Interactive)
+    switch ($Policy) {
+        'upgrade' { return 'upgrade' }
+        'fail' { return 'fail' }
+        'continue' { return 'continue' }
+        'prompt' { if ($Interactive) { return 'prompt' } else { return 'fail' } }
+        default { return 'invalid' }
+    }
+}
+
+function Test-ClaudeMcpCommand {
+    param([string]$Command)
+    $help = (& claude mcp --help 2>$null | Out-String)
+    return $help -match "(?m)^\s+$([regex]::Escape($Command))(?:\s|$)"
+}
+
+function Test-ClaudeMcpHttp {
+    $help = (& claude mcp add --help 2>$null | Out-String)
+    return $help -match '(?s)--transport.*\bhttp\b'
+}
+
+function Test-ClaudeMcpUserScope {
+    $help = (& claude mcp add --help 2>$null | Out-String)
+    return $help -match '(?s)--scope.*\buser\b'
+}
+
+function Install-ClaudeStable {
+    Warn "installing Claude Code from Anthropic's stable channel"
+    try {
+        $installer = [scriptblock]::Create(
+            (Invoke-RestMethod -Uri 'https://claude.ai/install.ps1'))
+        & $installer stable
+    } catch {
+        Die "Claude Code stable-channel install failed: $_"
+    }
+    $env:Path = "$(Join-Path $env:USERPROFILE '.local\bin');$BinDir;$env:Path"
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        Die 'Claude Code installed but `claude` is not on PATH. Open a new terminal and re-run.'
+    }
+}
+
+function Update-ClaudeState {
+    $output = (& claude --version 2>$null | Out-String).Trim()
+    $script:ClaudeVersion = ConvertFrom-ClaudeVersionString $output
+    $script:ClaudeVersionStatus = Get-ClaudeVersionStatus $script:ClaudeVersion
+    $script:ClaudeMcpAdd = Test-ClaudeMcpCommand 'add'
+    $script:ClaudeMcpGet = Test-ClaudeMcpCommand 'get'
+    $script:ClaudeMcpLogin = Test-ClaudeMcpCommand 'login'
+    $script:ClaudeMcpHttp = Test-ClaudeMcpHttp
+    $script:ClaudeMcpUserScope = Test-ClaudeMcpUserScope
+}
+
+function Test-ClaudeRequiredCapabilities {
+    return $script:ClaudeMcpAdd -and $script:ClaudeMcpGet -and
+        $script:ClaudeMcpHttp -and $script:ClaudeMcpUserScope
+}
+
+function Confirm-ClaudeCompatibility {
+    $policy = if ($env:QBRAID_CODE_CLAUDE_POLICY) {
+        $env:QBRAID_CODE_CLAUDE_POLICY.ToLower()
+    } else {
+        'prompt'
+    }
+    if ($policy -notin @('prompt', 'upgrade', 'fail', 'continue')) {
+        Die 'QBRAID_CODE_CLAUDE_POLICY must be prompt, upgrade, fail, or continue.'
+    }
+    $interactive = Test-InteractiveConsole
+
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        $action = Get-ClaudePolicyAction $policy $interactive
+        if ($action -eq 'upgrade') {
+            Install-ClaudeStable
+        } elseif ($action -eq 'prompt') {
+            if (Confirm-Step 'Claude Code is not installed. Install the stable channel now?' 'y') {
+                Install-ClaudeStable
+            } else {
+                Die 'Claude Code is required. Re-run with QBRAID_CODE_CLAUDE_POLICY=upgrade to install it.'
+            }
+        } else {
+            Die 'Claude Code is not installed. Re-run with QBRAID_CODE_CLAUDE_POLICY=upgrade.'
+        }
+    }
+
+    Update-ClaudeState
+    $issue = $null
+    if ($script:ClaudeVersionStatus -eq 'unknown') {
+        $issue = 'could not determine its version'
+    } elseif ($script:ClaudeVersionStatus -eq 'below-minimum') {
+        $issue = "version $($script:ClaudeVersion) is below the supported minimum $script:ClaudeMinVersion"
+    }
+    if (-not (Test-ClaudeRequiredCapabilities)) {
+        if ($issue) { $issue += '; ' }
+        $issue += 'required HTTP MCP commands are unavailable'
+    }
+
+    $upgraded = $false
+    if ($issue) {
+        $action = Get-ClaudePolicyAction $policy $interactive
+        if ($script:ClaudeVersionStatus -eq 'newer-than-tested') {
+            if ($action -in @('continue', 'prompt')) {
+                Warn "Claude Code $($script:ClaudeVersion) is newer than tested and lacks required capabilities; refusing to downgrade it and continuing with reduced compatibility."
+                $action = 'handled'
+            } else {
+                Die "Claude Code $($script:ClaudeVersion) is newer than tested and lacks required capabilities. Refusing to downgrade it; set QBRAID_CODE_CLAUDE_POLICY=continue to skip unavailable features."
+            }
+        }
+        if ($action -eq 'upgrade') {
+            Warn "the installed Claude Code is incompatible: $issue"
+            Install-ClaudeStable
+            $upgraded = $true
+        } elseif ($action -eq 'prompt') {
+            Warn "the installed Claude Code is incompatible: $issue"
+            if (Confirm-Step 'Upgrade Claude Code to the stable channel now?' 'y') {
+                Install-ClaudeStable
+                $upgraded = $true
+            } else {
+                Warn 'continuing with reduced compatibility at your request'
+            }
+        } elseif ($action -eq 'continue') {
+            Warn "continuing with an unsupported Claude Code: $issue"
+        } elseif ($action -eq 'handled') {
+            # The newer-version branch above already reported the safe fallback.
+        } else {
+            Die "the installed Claude Code is incompatible: $issue. Upgrade it, or explicitly set QBRAID_CODE_CLAUDE_POLICY=continue."
+        }
+    }
+
+    if ($upgraded) {
+        Update-ClaudeState
+        if ($script:ClaudeVersionStatus -in @('unknown', 'below-minimum') -or
+            -not (Test-ClaudeRequiredCapabilities)) {
+            Die "Claude Code was upgraded, but version $script:ClaudeMinVersion+ with HTTP MCP support is still unavailable."
+        }
+    }
+
+    if ($script:ClaudeVersionStatus -eq 'newer-than-tested') {
+        Warn "Claude Code $($script:ClaudeVersion) is newer than the latest tested version ($script:ClaudeTestedMax); continuing without downgrading."
+    } elseif ($script:ClaudeVersionStatus -eq 'tested') {
+        Ok "Claude Code $($script:ClaudeVersion)"
+    } else {
+        $displayVersion = if ($script:ClaudeVersion) { $script:ClaudeVersion } else { 'present' }
+        Warn "Claude Code $displayVersion remains outside the supported range; unavailable features will be skipped."
+    }
+}
+
 # ---------------------------------------------------------------- 1. platform
 
 if (-not [Environment]::Is64BitOperatingSystem) {
@@ -82,24 +260,7 @@ New-Item -ItemType Directory -Force -Path $HomeDir, $BinDir, $ClaudeDir | Out-Nu
 # ------------------------------------------------------------ 2. claude code
 
 Say 'Claude Code'
-if (Get-Command claude -ErrorAction SilentlyContinue) {
-    Ok 'already installed'
-} else {
-    Warn 'not installed — installing'
-    # Anthropic's official installer: a native binary, no Node.js, no admin rights.
-    try {
-        & ([scriptblock]::Create((Invoke-RestMethod -Uri 'https://claude.ai/install.ps1')))
-    } catch {
-        Die "Claude Code install failed: $_"
-    }
-    # Anthropic's installer always writes to %USERPROFILE%\.local\bin; $BinDir is
-    # overridable and may be somewhere else entirely.
-    $env:Path = "$(Join-Path $env:USERPROFILE '.local\bin');$BinDir;$env:Path"
-    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
-        Die 'Claude Code installed but `claude` is not on PATH. Open a new terminal and re-run.'
-    }
-    Ok 'installed'
-}
+Confirm-ClaudeCompatibility
 
 # ------------------------------------------------------------- 3. credential
 
@@ -485,19 +646,32 @@ if ($Global) {
 # ------------------------------------------------------------------- 10. mcp
 
 Say 'qBraid MCP'
-claude mcp get $McpName *> $null
-if ($LASTEXITCODE -eq 0) {
-    Ok 'already registered'
+$mcpRegistered = $false
+if (-not (Test-ClaudeRequiredCapabilities)) {
+    Warn 'this Claude Code version cannot register an HTTP MCP server from the command line.'
+    Warn "Start Claude Code, run /mcp, and add $McpUrl manually; or upgrade Claude Code."
 } else {
+    claude mcp get $McpName *> $null
+}
+if ((Test-ClaudeRequiredCapabilities) -and $LASTEXITCODE -eq 0) {
+    $mcpRegistered = $true
+    Ok 'already registered'
+} elseif (Test-ClaudeRequiredCapabilities) {
     claude mcp add --transport http $McpName $McpUrl --scope user *> $null
     if ($LASTEXITCODE -ne 0) { Die 'could not register the qBraid MCP server.' }
+    $mcpRegistered = $true
     Ok "registered $McpUrl"
 }
 
 # The MCP endpoint is JWT-only (OAuth + dynamic client registration): the API
 # key above cannot authorize it. Do the browser sign-in now, while the user is
 # still here, rather than surprising them mid-session.
-if (Confirm-Step 'Sign in to the qBraid MCP now? (opens a browser)' 'y') {
+if (-not $mcpRegistered) {
+    Warn 'MCP sign-in was skipped because registration is incomplete.'
+} elseif (-not $script:ClaudeMcpLogin) {
+    Warn 'this Claude Code version authenticates MCP servers through its interactive menu.'
+    Warn "Start Claude Code, run /mcp, select '$McpName', and choose Authenticate."
+} elseif (Confirm-Step 'Sign in to the qBraid MCP now? (opens a browser)' 'y') {
     # Unlike the piped bash path, `iex` keeps the console attached, so the
     # OAuth prompt can read the redirect URL directly.
     claude mcp login $McpName
