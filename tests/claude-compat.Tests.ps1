@@ -8,6 +8,10 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
 if ($errors) { throw "could not parse install.ps1: $errors" }
 
 $needed = @(
+    'Write-RawText',
+    'Invoke-NativeQuietly',
+    'Get-EnvMap',
+    'Confirm-Step',
     'ConvertFrom-ClaudeVersionString',
     'Compare-ClaudeVersion',
     'Test-ClaudeUpgradeSafe',
@@ -43,6 +47,43 @@ function Assert-Equal {
         Write-Host "  FAIL $Name`: got [$Actual] want [$Expected]"
     }
 }
+
+$writeRawTextDefinition = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Write-RawText'
+}, $true) | Select-Object -First 1
+$firstWriteRawTextCall = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Write-RawText'
+}, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1
+Assert-Equal 'Write-RawText is defined before its first call' `
+    ($writeRawTextDefinition.Extent.StartOffset -lt $firstWriteRawTextCall.Extent.StartOffset) $true
+Assert-Equal 'expected native failure is returned instead of terminating' `
+    (Invoke-NativeQuietly 'cmd.exe' @('/c', 'echo expected 1>&2 & exit /b 7')) 7
+$getEnvMapDefinition = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-EnvMap'
+}, $true) | Select-Object -First 1
+$firstGetEnvMapCall = $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -eq 'Get-EnvMap'
+}, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1
+Assert-Equal 'Get-EnvMap is defined before its first call' `
+    ($getEnvMapDefinition.Extent.StartOffset -lt $firstGetEnvMapCall.Extent.StartOffset) $true
+$installerText = Get-Content $source -Raw
+foreach ($adaptiveModel in @('claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-4-6')) {
+    Assert-Equal "filter fixed thinking for $adaptiveModel" `
+        ($installerText -match [regex]::Escape("- name: `"$adaptiveModel`"")) $true
+}
+Assert-Equal 'thinking compatibility filter removes request fields' `
+    ($installerText -match '- \"thinking\"' -and $installerText -match '- \"output_config\"') $true
+function global:Read-Host { return $null }
+Assert-Equal 'exhausted stdin uses the confirmation default' (Confirm-Step 'Continue?' 'y') $true
+Remove-Item Function:\Read-Host
 
 $script:ClaudeMinVersion = '2.1.186'
 $script:ClaudeTestedMax = '2.1.238'

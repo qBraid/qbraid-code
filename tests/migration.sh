@@ -21,6 +21,13 @@ printf 'QBRAID_CODE_BASE_URL=https://example.invalid\nQBRAID_CODE_TOKEN=legacy-t
 printf 'legacy-cache\n' > "$ROOT/credits.cache"
 printf 'legacy-auth\n' > "$ROOT/proxy-auth/session"
 printf 'api-key: legacy-token\n' > "$ROOT/proxy-config.yaml"
+NO_SS_BIN="$TMP/no-secret-service"
+mkdir -p "$NO_SS_BIN"
+cat > "$NO_SS_BIN/secret-tool" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$NO_SS_BIN/secret-tool"
 
 pass=0; fail=0
 for slug in default a A0 'team.one' 'team_name' 'team-name' 12345678901234567890123456789012; do
@@ -37,7 +44,7 @@ else
   fail=$((fail + 1)); printf '  FAIL C-locale label handling split UTF-8\n'
 fi
 
-adopt_legacy_profile "$ROOT"
+PATH="$NO_SS_BIN:$PATH" adopt_legacy_profile "$ROOT"
 if ! grep -q 'legacy-token' "$ROOT/profiles/default/env" &&
    grep -q 'QBRAID_CODE_SECRET_BACKEND=file' "$ROOT/profiles/default/env" &&
    [ "$(cat "$ROOT/secrets/default")" = legacy-token ] &&

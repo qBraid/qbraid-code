@@ -1037,6 +1037,21 @@ PEOF
         [ -n "$gm" ] || continue
         printf '      - name: "%s"\n        alias: "%s"\n' "$gm" "$gm"
       done
+      cat <<'PEOF'
+payload:
+  # Claude Code currently emits fixed-budget thinking for these custom model
+  # IDs, but their upstream APIs accept adaptive thinking only. CLIProxyAPI's
+  # filter phase is the reliable compatibility boundary: omit the incompatible
+  # fields rather than let every request fail with HTTP 400.
+  filter:
+    - models:
+        - name: "claude-opus-4-8"
+        - name: "claude-opus-5"
+        - name: "claude-sonnet-4-6"
+      params:
+        - "thinking"
+        - "output_config"
+PEOF
     } > "$PROFILE_DIR/proxy-template.yaml"
     chmod 600 "$PROFILE_DIR/proxy-template.yaml"
     umask "$OLD_UMASK"

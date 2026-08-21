@@ -49,7 +49,7 @@ done
 case "$url" in
   *billing/credits/balance*) org=org-alpha; case "$cfg" in *key-beta*) org=org-beta ;; esac; body="{\"data\":{\"organizationId\":\"$org\",\"qbraidCredits\":100}}"; code=200 ;;
   *organizations/current*) body='{"data":{"name":"Verified Lab"}}'; code=200 ;; *'/quota') body='{"plan":"pro"}'; code=200 ;;
-  *'/ai/models') body='{"data":[{"id":"claude-haiku-4-5","context_window":200000},{"id":"gpt-5.4","context_window":400000}]}'; code=200 ;;
+  *'/ai/models') body='{"data":[{"id":"claude-haiku-4-5","context_window":200000},{"id":"claude-opus-4-8","context_window":1000000},{"id":"claude-opus-5","context_window":1000000},{"id":"claude-sonnet-4-6","context_window":1000000},{"id":"gpt-5.4","context_window":400000}]}'; code=200 ;;
   *'/v1/messages') body='{"content":[{"text":"OK"}]}'; code=200 ;; *api.github.com*) exit 22 ;;
   *) body='{}'; code=404 ;;
 esac
@@ -112,6 +112,13 @@ if ! grep -q 'ANTHROPIC_' "$HOME_ROOT/.claude/settings.json" &&
    ! grep -q 'key-alpha\|key-beta' "$HOME_ROOT/.claude/settings.json"; then
   ok 'unsafe legacy plain-Claude credentials are removed'
 else bad 'plain Claude credential cleanup'; fi
+if grep -q 'name: "claude-opus-4-8"' "$BETA_DIR/proxy-template.yaml" &&
+   grep -q 'name: "claude-opus-5"' "$BETA_DIR/proxy-template.yaml" &&
+   grep -q 'name: "claude-sonnet-4-6"' "$BETA_DIR/proxy-template.yaml" &&
+   grep -q '^[[:space:]]*- "thinking"$' "$BETA_DIR/proxy-template.yaml" &&
+   grep -q '^[[:space:]]*- "output_config"$' "$BETA_DIR/proxy-template.yaml"; then
+  ok 'adaptive-only Claude models filter incompatible fixed thinking'
+else bad 'Claude thinking compatibility filter'; fi
 
 if QBRAID_API_KEY=key-alpha bash install.sh --profile beta > "$TMP/cross.out" 2> "$TMP/cross.err"; then
   bad 'profile accepted a different organization'

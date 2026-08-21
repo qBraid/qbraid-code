@@ -54,6 +54,40 @@ $ClaudeJson = Join-Path $env:USERPROFILE '.claude.json'
 function Say  { param($m) Write-Host "==> $m" -ForegroundColor White }
 function Ok   { param($m) Write-Host "  + $m" -ForegroundColor Green }
 function Warn { param($m) Write-Host "  ! $m" -ForegroundColor Yellow }
+function Write-RawText {
+    param([string]$Path, [string]$Text)
+    # Windows PowerShell 5.1 emits a BOM for `Set-Content -Encoding UTF8`,
+    # and a BOM on a .cmd makes cmd.exe fail to parse its first line.
+    if ($Path.EndsWith('.cmd')) {
+        $Text = ($Text -replace "`r`n", "`n") -replace "`n", "`r`n"
+    }
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false))
+}
+function Invoke-NativeQuietly {
+    param([string]$FilePath, [string[]]$ArgumentList)
+    # Windows PowerShell 5.1 promotes a native process's stderr to an error
+    # record. Under this installer's Stop preference, an expected non-zero
+    # probe would otherwise terminate the script before LASTEXITCODE is read.
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @ArgumentList *> $null
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+}
+function Get-EnvMap {
+    param([string]$Path)
+    $values = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $values }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*([A-Z_]+)\s*=\s*(.*)$') {
+            $values[$Matches[1]] = $Matches[2]
+        }
+    }
+    return $values
+}
 function Test-InteractiveConsole {
     try { return -not [Console]::IsInputRedirected } catch { return $false }
 }
@@ -81,17 +115,14 @@ function Get-Prop {
 function Confirm-Step {
     param([string]$Question, [string]$Default = 'y')
     $hint = if ($Default -eq 'y') { '[Y/n]' } else { '[y/N]' }
-    $reply = (Read-Host "$Question $hint").Trim().ToLower()
+    $reply = Read-Host "$Question $hint"
+    # Redirected or exhausted stdin makes Read-Host return null in Windows
+    # PowerShell 5.1. Treat it like an empty answer rather than aborting a
+    # nearly completed installation by calling methods on null.
+    if ($null -eq $reply) { $reply = '' }
+    $reply = $reply.Trim().ToLower()
     if ([string]::IsNullOrEmpty($reply)) { $reply = $Default }
     return ($reply -eq 'y' -or $reply -eq 'yes')
-}
-
-function Write-RawText {
-    param([string]$Path, [string]$Text)
-    if ($Path.EndsWith('.cmd')) {
-        $Text = ($Text -replace "`r`n", "`n") -replace "`n", "`r`n"
-    }
-    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false))
 }
 
 function Read-PidFile {
@@ -319,12 +350,12 @@ if (-not $Profile) { $Profile = 'default' }
 if ($Profile -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$') { Die "invalid profile '$Profile'" }
 $ProfileRoot = Join-Path $ProfilesDir $Profile
 $ProfileDir = $ProfileRoot
-$legacyEnv = Join-Path $HomeDir 'env'
+$legacyEnvPath = Join-Path $HomeDir 'env'
 $defaultDir = Join-Path $ProfilesDir 'default'
-if ((Test-Path $legacyEnv) -and -not (Test-Path $defaultDir)) {
+if ((Test-Path $legacyEnvPath) -and -not (Test-Path $defaultDir)) {
     $migrationDir = Join-Path $ProfilesDir (".default.migrate.$PID.$([guid]::NewGuid().ToString('N'))")
     New-Item -ItemType Directory -Force -Path $migrationDir | Out-Null
-    $legacyLines = @(Get-Content $legacyEnv)
+    $legacyLines = @(Get-Content $legacyEnvPath)
     $legacyToken = ''
     $safeLines = @($legacyLines | Where-Object { if ($_ -match '^QBRAID_CODE_TOKEN=(.*)$') { $legacyToken = $Matches[1]; $false } else { $true } })
     if ($legacyToken) {
@@ -349,13 +380,13 @@ if ((Test-Path $legacyEnv) -and -not (Test-Path $defaultDir)) {
 }
 function Remove-LegacyPlaintextToken {
     if (-not (Test-Path $defaultDir)) { return }
-    if (Test-Path $legacyEnv) {
-        $legacyLines = @(Get-Content $legacyEnv)
+    if (Test-Path $legacyEnvPath) {
+        $legacyLines = @(Get-Content $legacyEnvPath)
         if (@($legacyLines | Where-Object { $_ -match '^QBRAID_CODE_TOKEN=' }).Count -gt 0) {
             $lines = @($legacyLines | Where-Object { $_ -notmatch '^QBRAID_CODE_TOKEN=' })
-            $cleanEnv = "$legacyEnv.clean.$PID.$([guid]::NewGuid().ToString('N'))"
+            $cleanEnv = "$legacyEnvPath.clean.$PID.$([guid]::NewGuid().ToString('N'))"
             Write-RawText $cleanEnv (($lines -join "`n") + "`n")
-            Move-Item $cleanEnv $legacyEnv -Force
+            Move-Item $cleanEnv $legacyEnvPath -Force
         }
     }
     $legacyConfig = Join-Path $HomeDir 'proxy-config.yaml'
@@ -431,11 +462,11 @@ $globalProfilePath = Join-Path $HomeDir 'global-profile'
 if (Test-Path $Settings) {
     try {
         $legacySettings = Get-Content $Settings -Raw | ConvertFrom-Json
-        $legacyEnv = Get-Prop $legacySettings 'env'
-        $legacyBase = Get-Prop $legacyEnv 'ANTHROPIC_BASE_URL'
+        $legacyClaudeEnv = Get-Prop $legacySettings 'env'
+        $legacyBase = Get-Prop $legacyClaudeEnv 'ANTHROPIC_BASE_URL'
         if ($legacyBase -like '*api-v2.qbraid.com*') {
             foreach ($key in @('ANTHROPIC_BASE_URL','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_MODEL','ANTHROPIC_SMALL_FAST_MODEL','QBRAID_CODE_PROFILE','QBRAID_CODE_HOME')) {
-                $legacyEnv.PSObject.Properties.Remove($key)
+                $legacyClaudeEnv.PSObject.Properties.Remove($key)
             }
             Write-RawText $Settings ($legacySettings | ConvertTo-Json -Depth 20)
             Warn 'removed unsafe legacy plain-Claude gateway settings; use qbraid-code'
@@ -705,8 +736,6 @@ if ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot 'qbraid-code.cmd'))) 
     $SrcDir = $PSScriptRoot
 }
 
-# Set-Content -Encoding UTF8 emits a BOM on Windows PowerShell 5.1, and a BOM
-# on a .cmd makes cmd.exe fail to parse its first line. Write bytes directly.
 function Fetch-File {
     param([string]$Name, [string]$Dest)
     if ($SrcDir) {
@@ -849,6 +878,18 @@ if ($ProxyBin) {
             $yaml += "      - name: `"$gm`""
             $yaml += "        alias: `"$gm`""
         }
+        $yaml += 'payload:'
+        $yaml += '  # Claude Code currently emits fixed-budget thinking for these custom model'
+        $yaml += '  # IDs, but their upstream APIs accept adaptive thinking only. Omit the'
+        $yaml += '  # incompatible fields rather than let every request fail with HTTP 400.'
+        $yaml += '  filter:'
+        $yaml += '    - models:'
+        $yaml += '        - name: "claude-opus-4-8"'
+        $yaml += '        - name: "claude-opus-5"'
+        $yaml += '        - name: "claude-sonnet-4-6"'
+        $yaml += '      params:'
+        $yaml += '        - "thinking"'
+        $yaml += '        - "output_config"'
         Write-RawText (Join-Path $ProfileDir 'proxy-template.yaml') (($yaml -join "`n") + "`n")
         Ok "proxy configured: all $($gptModels.Count + $claudeModels.Count) models on one endpoint (starts on demand)"
     }
@@ -906,15 +947,16 @@ Ok "statusline enabled in $Settings"
 Say 'qBraid MCP'
 $mcpRegistered = $false
 if ($script:ClaudeMcpGet) {
-    claude mcp get $McpName *> $null
-    if ($LASTEXITCODE -eq 0) {
+    if ((Invoke-NativeQuietly 'claude' @('mcp', 'get', $McpName)) -eq 0) {
         $mcpRegistered = $true
         Ok 'already registered'
     }
 }
 if (-not $mcpRegistered -and (Test-ClaudeRequiredCapabilities)) {
-    claude mcp add --transport http $McpName $McpUrl --scope user *> $null
-    if ($LASTEXITCODE -ne 0) { Die 'could not register the qBraid MCP server.' }
+    $mcpAddExitCode = Invoke-NativeQuietly 'claude' @(
+        'mcp', 'add', '--transport', 'http', $McpName, $McpUrl, '--scope', 'user'
+    )
+    if ($mcpAddExitCode -ne 0) { Die 'could not register the qBraid MCP server.' }
     $mcpRegistered = $true
     Ok "registered $McpUrl"
 } elseif (-not $mcpRegistered) {
@@ -933,8 +975,16 @@ if (-not $mcpRegistered) {
 } elseif (Confirm-Step 'Sign in to the qBraid MCP now? (opens a browser)' 'y') {
     # Unlike the piped bash path, `iex` keeps the console attached, so the
     # OAuth prompt can read the redirect URL directly.
-    claude mcp login $McpName
-    if ($LASTEXITCODE -ne 0) { Warn "MCP sign-in did not complete. Run ``claude mcp login $McpName`` later." }
+    $savedPreference = $ErrorActionPreference
+    $mcpLoginExitCode = 1
+    try {
+        $ErrorActionPreference = 'Continue'
+        claude mcp login $McpName
+        $mcpLoginExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedPreference
+    }
+    if ($mcpLoginExitCode -ne 0) { Warn "MCP sign-in did not complete. Run ``claude mcp login $McpName`` later." }
 } else {
     Warn "skipped. Run ``claude mcp login $McpName`` when you want the qBraid tools."
 }

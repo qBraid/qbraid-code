@@ -67,6 +67,9 @@ Claude Code installation.
 The installer never downgrades a newer or unrecognized version. If your version
 cannot run `claude mcp login`, authenticate through Claude Code's `/mcp` menu.
 
+Maintainers can reproduce the Windows compatibility matrix in a real Windows
+11 VM by following [the Windows VM E2E guide](docs/windows-vm-e2e.md).
+
 ## Start a session
 
 Start an interactive session with the active organization and default model.
@@ -198,11 +201,14 @@ because one process cannot use several context limits safely.
 
 ### Model thinking
 
-Claude Code sends adaptive thinking, display policy, and effort for current
-Opus models.
+Claude Code currently sends fixed-budget thinking for qBraid's custom Opus 4.8,
+Opus 5, and Sonnet 4.6 model IDs, while those upstream models accept adaptive
+thinking only. The per-launch proxy removes the incompatible `thinking` and
+`output_config` fields for those exact IDs so requests remain valid. They
+currently run without extended thinking; Haiku's legacy thinking and GPT
+reasoning are unaffected.
 
-The older global thinking-disable workaround is gone. The 128-tool limit is
-independent of thinking.
+The 128-tool limit is independent of thinking.
 
 ## Keep plain `claude` unchanged
 
@@ -213,11 +219,12 @@ a project setting can replace the base URL and exfiltrate a reusable key.
 ## How it works
 
 Claude Code sends Anthropic Messages requests to the qBraid gateway. The local
-proxy translates only the GPT routes.
+proxy translates GPT routes and removes incompatible fixed-thinking fields from
+known adaptive-only Claude model IDs.
 
 ```text
 qbraid-code ── loopback CLIProxyAPI
-                 ├─ Claude passthrough ── qBraid gateway
+                 ├─ Claude normalization ── qBraid gateway
                  └─ GPT translation ──── qBraid gateway
 ```
 
