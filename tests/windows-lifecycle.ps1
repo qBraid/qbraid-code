@@ -420,7 +420,15 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     $env:USERPROFILE = $absentCustomProfile
     Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyContinue
     Push-Location $absentCustomBin
-    try { & cmd.exe /d /c qbraid-code.cmd --uninstall --yes *> $null; $absentCustomExit = $LASTEXITCODE } finally { Pop-Location }
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & cmd.exe /d /c qbraid-code.cmd --uninstall --yes *> $null
+        $absentCustomExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+        Pop-Location
+    }
     if ($absentCustomExit -eq 0 -and -not (Test-Path (Join-Path $absentCustomBin 'qbraid-code.cmd')) -and
         -not (Test-Path (Join-Path $absentCustomBin 'qbraid-launch.ps1')) -and -not (Test-Path (Join-Path $absentCustomBin 'qbraid-code.home'))) {
         Pass 'absent custom root still permits bound launcher cleanup'

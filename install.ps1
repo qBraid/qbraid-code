@@ -136,7 +136,9 @@ function Stop-VerifiedProxyProcess {
     }
     if (-not $owned) { Die "stale process $ProxyProcessId uses the proxy config but is not an owned executable" }
     Stop-Process -Id $ProxyProcessId -Force -ErrorAction Stop
-    Wait-Process -Id $ProxyProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    for ($attempt = 0; $attempt -lt 50 -and (Get-Process -Id $ProxyProcessId -ErrorAction SilentlyContinue); $attempt++) {
+        Start-Sleep -Milliseconds 100
+    }
     if (Get-Process -Id $ProxyProcessId -ErrorAction SilentlyContinue) { Die "could not stop owned stale proxy process $ProxyProcessId" }
 }
 

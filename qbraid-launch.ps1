@@ -99,7 +99,7 @@ function Get-QbraidEnvFiles {
             if (Test-Path $candidate -PathType Leaf) { [void]$result.Add($candidate) }
         }
     }
-    return @($result)
+    return $result.ToArray()
 }
 
 function Get-QbraidProxyBinaries {
@@ -110,7 +110,7 @@ function Get-QbraidProxyBinaries {
             if ($line -match '^QBRAID_CODE_PROXY_BIN=(.+)$' -and -not $result.Contains($Matches[1])) { [void]$result.Add($Matches[1]) }
         }
     }
-    return @($result)
+    return $result.ToArray()
 }
 
 function Get-QbraidSecretRecords {
@@ -134,7 +134,7 @@ function Get-QbraidSecretRecords {
         }
         [void]$records.Add([pscustomobject]@{ Backend = $backend; Reference = $reference })
     }
-    return @($records)
+    return $records.ToArray()
 }
 
 function Repair-QbraidJsonArtifacts {
@@ -251,7 +251,9 @@ function Stop-QbraidOwnedProcess {
     }
     if (-not $executableMatches) { throw "running process $ProcessId is not an owned qbraid-code proxy" }
     Stop-Process -Id $ProcessId -Force -ErrorAction Stop
-    Wait-Process -Id $ProcessId -Timeout 5 -ErrorAction SilentlyContinue
+    for ($attempt = 0; $attempt -lt 50 -and (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue); $attempt++) {
+        Start-Sleep -Milliseconds 100
+    }
     if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) { throw "could not stop owned proxy process $ProcessId" }
 }
 

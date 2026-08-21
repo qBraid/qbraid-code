@@ -75,7 +75,9 @@ switch ($Action) {
             exit 1
         }
         Stop-Process -Id $proxyPid -Force -ErrorAction Stop
-        Wait-Process -Id $proxyPid -Timeout 5 -ErrorAction SilentlyContinue
+        for ($attempt = 0; $attempt -lt 50 -and (Get-Process -Id $proxyPid -ErrorAction SilentlyContinue); $attempt++) {
+            Start-Sleep -Milliseconds 100
+        }
         if (Get-Process -Id $proxyPid -ErrorAction SilentlyContinue) { Write-Error "could not stop owned proxy process $proxyPid"; exit 1 }
         Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
         Write-Output 'proxy stopped'
