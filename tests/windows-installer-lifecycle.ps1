@@ -43,7 +43,7 @@ try {
     $env:QBRAID_CODE_PROFILE_LABEL = 'Local Lab'
 
     @'
-param([Parameter(ValueFromRemainingArguments=$true)][string[]]$InstallerArguments)
+param([string]$Profile = '', [switch]$UpdateKey)
 $ErrorActionPreference = 'Stop'
 function global:Read-Host {
     param([string]$Prompt, [switch]$AsSecureString)
@@ -83,7 +83,7 @@ function global:Invoke-RestMethod {
     if ($Uri -like '*/v1/messages') { return [pscustomobject]@{ content = @([pscustomobject]@{ text = 'OK' }) } }
     throw "unexpected request: $Uri"
 }
-& (Join-Path $env:TEST_REPO_ROOT 'install.ps1') @InstallerArguments
+& (Join-Path $env:TEST_REPO_ROOT 'install.ps1') -Profile $Profile -UpdateKey:$UpdateKey
 exit $LASTEXITCODE
 '@ | Set-Content (Join-Path $tmp 'installer-wrapper.ps1') -Encoding UTF8
 
