@@ -37,6 +37,8 @@ proxy_listening() {
     -H "Authorization: Bearer $(cat "$HOME_DIR/proxy.key")" 2>/dev/null
 }
 
+PROXY_STARTED_BY_US=0
+
 start_proxy() {
   proxy_listening && return 0
   [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] || {
@@ -52,7 +54,10 @@ start_proxy() {
     >> "$HOME_DIR/proxy.log" 2>&1 &
   i=0
   while [ "$i" -lt 40 ]; do
-    proxy_listening && return 0
+    if proxy_listening; then
+      PROXY_STARTED_BY_US=1
+      return 0
+    fi
     sleep 0.3
     i=$((i + 1))
   done
@@ -244,10 +249,40 @@ fi
 # FORCED, not defaulted: an inherited MAX_THINKING_TOKENS from the user's
 # shell re-enables thinking and turns every request into that 400. Relax to
 # Claude-only once the gateway accepts "adaptive".
-MAX_THINKING_TOKENS=0 \
-ANTHROPIC_BASE_URL="$RUN_BASE" \
-ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
-ANTHROPIC_MODEL="$RUN_MODEL" \
-ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
-CLAUDE_CODE_SUBAGENT_MODEL="$RUN_MODEL" \
-exec claude "$@"
+run_claude() {
+  MAX_THINKING_TOKENS=0 \
+  ANTHROPIC_BASE_URL="$RUN_BASE" \
+  ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
+  ANTHROPIC_MODEL="$RUN_MODEL" \
+  ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
+  CLAUDE_CODE_SUBAGENT_MODEL="$RUN_MODEL" \
+  claude "$@"
+}
+
+if [ "$PROXY_STARTED_BY_US" = 1 ]; then
+  # We started the proxy for this session, so we clean it up — leaving a
+  # background process running after the user quits is our bug, not theirs.
+  # A proxy that was ALREADY running belongs to someone else: leave it.
+  # No `exec` here, so this shell survives to do the cleanup; the trap also
+  # covers Ctrl+C and terminal close.
+  stop_our_proxy() {
+    pkill -f "$PROXY_BIN -config $HOME_DIR/proxy-config.yaml" 2>/dev/null || true
+  }
+  trap 'stop_our_proxy' EXIT INT TERM HUP
+  run_claude "$@"
+  STATUS=$?
+  stop_our_proxy
+  trap - EXIT INT TERM HUP
+  exit "$STATUS"
+fi
+
+exec_claude() {
+  MAX_THINKING_TOKENS=0 \
+  ANTHROPIC_BASE_URL="$RUN_BASE" \
+  ANTHROPIC_AUTH_TOKEN="$RUN_TOKEN" \
+  ANTHROPIC_MODEL="$RUN_MODEL" \
+  ANTHROPIC_SMALL_FAST_MODEL="$RUN_MODEL" \
+  CLAUDE_CODE_SUBAGENT_MODEL="$RUN_MODEL" \
+  exec claude "$@"
+}
+exec_claude "$@"

@@ -300,36 +300,48 @@ else
   CREDITS="unknown"
 fi
 
-# /organizations/current returns the organization document, so `name` is the
-# organization's. /organizations/me returns MEMBERSHIP, whose first `name` is
-# the USER's — labelling the confirmation with that would be worse than
-# showing nothing. Scope the match to the data object, and print the id
-# alongside so a bad parse cannot quietly point someone at the wrong org.
+# An API key cannot read its organization's NAME: /organizations/current needs
+# a JWT org context and /organizations rejects key auth outright (both verified
+# 2026-08-20). Showing a raw Mongo id and asking "is this right?" is worse than
+# not asking — nobody recognises 507f1f77bcf86cd799439011. Show what the key
+# DOES tell us (plan, credits), name the organization only when it resolves,
+# and make the escape hatch the actionable sentence.
 ORG_NAME=""
 if [ -n "$ORG_ID" ]; then
   api_get "$API_BASE/organizations/current" "$API_KEY" "$ORG_ID"
-  ORG_DATA=$(printf '%s' "$API_BODY" | sed 's/.*"data"[[:space:]]*:[[:space:]]*{//')
-  ORG_NAME=$(json_str "$ORG_DATA" name)
+  if [ "$HTTP_STATUS" = 200 ]; then
+    ORG_DATA=$(printf '%s' "$API_BODY" | sed 's/.*"data"[[:space:]]*:[[:space:]]*{//')
+    ORG_NAME=$(json_str "$ORG_DATA" name)
+  fi
 fi
 
+PLAN=""
+api_get "$GATEWAY_URL/quota" "$API_KEY"
+[ "$HTTP_STATUS" = 200 ] && PLAN=$(json_str "$API_BODY" plan)
+
+printf '\n'
 if [ -n "$ORG_NAME" ]; then
-  printf '\n  Organization: %s%s%s  %s(%s)%s\n' \
-    "$bold" "$ORG_NAME" "$rst" "$dim" "$ORG_ID" "$rst"
-else
-  printf '\n  Organization: %s%s%s\n' "$bold" "${ORG_ID:-unknown}" "$rst"
+  printf '  Organization: %s%s%s\n' "$bold" "$ORG_NAME" "$rst"
 fi
-printf '  Credits:      %s%s%s\n\n' "$bold" "$CREDITS" "$rst"
+[ -n "$PLAN" ] && printf '  Plan:         %s%s%s\n' "$bold" "$PLAN" "$rst"
+printf '  Credits:      %s%s%s\n' "$bold" "$CREDITS" "$rst"
+if [ -z "$ORG_NAME" ]; then
+  printf '\n  These are the credits this API key can spend.\n'
+  printf '  Using a different organization means creating a key under it at\n'
+  printf '  %s%s%s\n' "$bold" "$KEYS_URL" "$rst"
+fi
+printf '\n'
 
-if ! confirm "Is this the right organization?" y; then
+if ! confirm "Continue with this account?" y; then
   cat <<EOF
 
-  Switch organization at ${bold}https://account.qbraid.com${rst}, or create a key
-  under the organization you want, then run this installer again.
+  No problem. Create a key under the organization you want at
+  ${bold}$KEYS_URL${rst}, then run this installer again.
 
 EOF
   exit 1
 fi
-ok "organization confirmed"
+ok "account confirmed"
 
 if [ "$CREDITS" != unknown ] && awk -v c="$CREDITS_RAW" 'BEGIN { exit !(c <= 0) }'; then
   warn "this organization has no credits left — requests will fail until it is topped up."

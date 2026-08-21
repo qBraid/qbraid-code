@@ -59,6 +59,7 @@ rem Unified route: the proxy serves every model on one endpoint (Claude
 rem passthrough, GPT translated). Fall back to the direct gateway for Claude
 rem models when the proxy is unavailable; GPT models require it.
 if not exist "%QC_HOME%\proxy-config.yaml" goto :noproxy
+powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1" status | find "not running" >nul && set "QC_PROXY_STARTED=1"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1" ensure
 if errorlevel 1 goto :noproxy
 set /p RUNTOKEN=<"%QC_HOME%\proxy.key"
@@ -103,8 +104,13 @@ set "ANTHROPIC_MODEL=%RUNMODEL%"
 set "ANTHROPIC_SMALL_FAST_MODEL=%RUNMODEL%"
 set "CLAUDE_CODE_SUBAGENT_MODEL=%RUNMODEL%"
 
+rem If we started the proxy for this session, stop it when claude exits —
+rem leaving a background process behind after the user quits is our bug.
+rem A proxy that was already running belongs to someone else: leave it.
 claude %*
-exit /b !ERRORLEVEL!
+set "CLAUDE_RC=!ERRORLEVEL!"
+if defined QC_PROXY_STARTED powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1" stop >nul 2>&1
+exit /b !CLAUDE_RC!
 
 :incomplete
 echo qbraid-code: "%QC_HOME%\env" is incomplete. 1>&2
