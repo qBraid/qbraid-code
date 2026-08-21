@@ -30,6 +30,8 @@ future-400k	400000
 EOF
 cat > "$BIN/curl" <<'EOF'
 #!/usr/bin/env bash
+last="${!#:-}"
+case "$last" in http://127.0.0.1:*/) exec /usr/bin/curl "$@" ;; esac
 out=""; status=0
 while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w) status=1; shift 2;; --config|-m) shift 2;; *) shift;; esac; done
 [ -z "$out" ] || printf '{}' > "$out"
@@ -58,6 +60,7 @@ if [ -n "${PROXY_WATCHER_READY:-}" ]; then i=0; while [ ! -f "$PROXY_WATCHER_REA
 printf '%s|%s|%s\n' "$ANTHROPIC_MODEL" "${CLAUDE_CODE_MAX_CONTEXT_TOKENS-unset}" "${args[*]}"
 EOF
 chmod +x "$BIN/claude"
+PYTHON_BIN=$(command -v python3)
 export QBRAID_CODE_HOME="$QC_HOME" PATH="$BIN:/usr/bin:/bin"
 
 pass=0; fail=0
@@ -74,8 +77,9 @@ check() {
 
 export CAPTURE_PROXY_CONFIG="$TMP/proxy.yaml"
 export PROXY_WATCHER_READY="$TMP/proxy-watcher.ready"
-python3 -m http.server 8780 --bind 127.0.0.1 > /dev/null 2>&1 & listener=$!
-sleep 0.3
+"$PYTHON_BIN" -m http.server 8780 --bind 127.0.0.1 > /dev/null 2>&1 & listener=$!
+i=0; while ! /usr/bin/curl -sS -m 1 -o /dev/null http://127.0.0.1:8780/ 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+if ! /usr/bin/curl -sS -m 1 -o /dev/null http://127.0.0.1:8780/ 2>/dev/null; then printf '  FAIL occupied-port fixture did not start\n'; exit 1; fi
 check 'million-token default gets marker and no process cap' \
   'claude-opus-5[1m]|unset|-p high' -p high
 kill "$listener" 2>/dev/null || true; wait "$listener" 2>/dev/null || true; listener=''
