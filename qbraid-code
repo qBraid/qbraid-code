@@ -50,8 +50,16 @@ start_proxy() {
     echo "qbraid-code: proxy config missing — re-run the installer." >&2
     return 1
   }
-  nohup "$PROXY_BIN" -config "$HOME_DIR/proxy-config.yaml" \
-    >> "$HOME_DIR/proxy.log" 2>&1 &
+  # `nohup` is POSIX and present everywhere in practice, but if it is missing
+  # the redirect below still detaches well enough for our purposes — better a
+  # working proxy than a hard failure over a missing convenience wrapper.
+  if command -v nohup >/dev/null 2>&1; then
+    nohup "$PROXY_BIN" -config "$HOME_DIR/proxy-config.yaml" \
+      >> "$HOME_DIR/proxy.log" 2>&1 &
+  else
+    "$PROXY_BIN" -config "$HOME_DIR/proxy-config.yaml" \
+      >> "$HOME_DIR/proxy.log" 2>&1 &
+  fi
   i=0
   while [ "$i" -lt 40 ]; do
     if proxy_listening; then
@@ -61,7 +69,17 @@ start_proxy() {
     sleep 0.3
     i=$((i + 1))
   done
-  echo "qbraid-code: proxy failed to start — see $HOME_DIR/proxy.log" >&2
+  # An empty log is the confusing case: it means the binary never ran (missing
+  # dependency, wrong architecture, quarantined) rather than failing on config.
+  echo "qbraid-code: the GPT proxy did not start." >&2
+  if [ -s "$HOME_DIR/proxy.log" ]; then
+    echo "Last lines of $HOME_DIR/proxy.log:" >&2
+    tail -5 "$HOME_DIR/proxy.log" >&2
+  else
+    echo "It produced no output at all — try running it directly to see why:" >&2
+    echo "  $PROXY_BIN -config $HOME_DIR/proxy-config.yaml" >&2
+  fi
+  echo "Claude models are unaffected; run qbraid-code without --model gpt-... " >&2
   return 1
 }
 
