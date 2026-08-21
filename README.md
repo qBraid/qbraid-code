@@ -181,9 +181,7 @@ because one process cannot use several context limits safely.
 ### Model thinking
 
 Claude Code sends adaptive thinking, display policy, and effort for current
-Opus models. This version requires
-[qbraid-api#1025](https://github.com/qBraid/qbraid-api/pull/1025) or later to
-preserve those fields at the provider boundary.
+Opus models.
 
 The older global thinking-disable workaround is gone. The 128-tool limit is
 independent of thinking.
