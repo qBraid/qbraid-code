@@ -13,6 +13,16 @@ $invalidCredentialResource = ''
 function Pass([string]$Name) { $script:pass++; Write-Output "  ok   $Name" }
 function Fail([string]$Name) { $script:fail++; Write-Output "  FAIL $Name" }
 function Write-Utf8([string]$Path, [string]$Value) { [IO.File]::WriteAllText($Path, $Value, (New-Object Text.UTF8Encoding $false)) }
+function Invoke-ChildPowerShell([string]$ScriptPath, [string[]]$ArgumentList = @()) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $ScriptPath @ArgumentList *> $null
+        return [int]$LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
 function New-Profile([string]$HomeDir, [string]$Backend, [string]$Reference) {
     $generation = Join-Path $HomeDir 'profiles\alpha\generations\g1'
     New-Item -ItemType Directory -Force -Path $generation | Out-Null
@@ -27,7 +37,7 @@ try {
     $env:USERPROFILE = $helpHome
     $env:QBRAID_CODE_HOME = Join-Path $helpHome 'missing-install'
     $help = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --help 6>&1 | Out-String
-    if ($LASTEXITCODE -eq 0 -and -not (Test-Path $helpHome) -and $help.Contains('--profiles') -and $help.Contains('--use-profile') -and
+    if ($LASTEXITCODE -eq 0 -and -not (Test-Path $env:QBRAID_CODE_HOME) -and $help.Contains('--profiles') -and $help.Contains('--use-profile') -and
         $help.Contains('--allow-profile-resume') -and $help.Contains('--update-key') -and $help.Contains('--doctor') -and
         $help.Contains('--stop') -and $help.Contains('--uninstall') -and $help.Contains('claude --help')) {
         Pass 'offline help lists every lifecycle command'
@@ -71,8 +81,7 @@ try {
     $env:QBRAID_CODE_RUNTIME_PROXY_BIN = $ownedProxyFixture
     $unownedStopProcess = Start-Process $unownedProxyFixture -ArgumentList @('-config', "`"$proxyStopConfig`"") -PassThru
     Write-Utf8 (Join-Path $proxyStopRuntime 'proxy.pid') ([string]$unownedStopProcess.Id)
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-proxy.ps1') stop *> $null
-    $unownedStopExit = $LASTEXITCODE
+    $unownedStopExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-proxy.ps1') @('stop')
     $unownedStopProcess.Refresh()
     if ($unownedStopExit -ne 0 -and -not $unownedStopProcess.HasExited -and (Test-Path (Join-Path $proxyStopRuntime 'proxy.pid'))) {
         Pass 'session cleanup refuses an unowned executable using its runtime config'
@@ -81,8 +90,7 @@ try {
 
     $ownedStopProcess = Start-Process $ownedProxyFixture -ArgumentList @('-config', "`"$proxyStopConfig`"") -PassThru
     Write-Utf8 (Join-Path $proxyStopRuntime 'proxy.pid') ([string]$ownedStopProcess.Id)
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-proxy.ps1') stop *> $null
-    $ownedStopExit = $LASTEXITCODE
+    $ownedStopExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-proxy.ps1') @('stop')
     $ownedStopProcess.Refresh()
     if ($ownedStopExit -eq 0 -and $ownedStopProcess.HasExited -and -not (Test-Path (Join-Path $proxyStopRuntime 'proxy.pid'))) {
         Pass 'session cleanup stops only its exact owned proxy executable'
@@ -105,14 +113,12 @@ try {
     Write-Utf8 (Join-Path $ownedRuntime 'owner.pid') ([string]$PID)
     $env:USERPROFILE = $ownedProcessUser
     $env:QBRAID_CODE_HOME = $ownedProcessHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --profile alpha --stop *> $null
-    $liveStopExit = $LASTEXITCODE
+    $liveStopExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--profile', 'alpha', '--stop')
     $ownedProxyProcess.Refresh()
     if ($liveStopExit -eq 0 -and -not $ownedProxyProcess.HasExited) { Pass '--stop preserves proxies owned by live Windows sessions' }
     else { Fail '--stop preserves proxies owned by live Windows sessions' }
     Write-Utf8 (Join-Path $ownedRuntime 'owner.pid') '99999996'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --profile alpha --stop *> $null
-    $orphanStopExit = $LASTEXITCODE
+    $orphanStopExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--profile', 'alpha', '--stop')
     $ownedProxyProcess.Refresh()
     if ($orphanStopExit -eq 0 -and $ownedProxyProcess.HasExited -and -not (Test-Path $ownedRuntime)) { Pass '--stop removes verified orphaned Windows proxies' }
     else { Fail '--stop removes verified orphaned Windows proxies' }
@@ -121,8 +127,7 @@ try {
     Write-Utf8 $ownedConfig "port: 8320`n"
     $ownedProxyProcess = Start-Process (Join-Path $ownedProcessHome 'cliproxyapi.exe') -ArgumentList @('-config', "`"$ownedConfig`"") -PassThru
     Write-Utf8 (Join-Path $ownedRuntime 'proxy.pid') ([string]$ownedProxyProcess.Id)
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --uninstall --yes *> $null
-    $ownedProcessExit = $LASTEXITCODE
+    $ownedProcessExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--uninstall', '--yes')
     $ownedProxyProcess.Refresh()
     if ($ownedProcessExit -eq 0 -and $ownedProxyProcess.HasExited -and -not (Test-Path $ownedProcessHome)) {
         Pass 'uninstall stops only an owned proxy executable with its exact config'
@@ -143,8 +148,7 @@ try {
     Write-Utf8 (Join-Path $unownedRuntime 'proxy.pid') ([string]$unownedProxyProcess.Id)
     $env:USERPROFILE = $unownedProcessUser
     $env:QBRAID_CODE_HOME = $unownedProcessHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --uninstall --yes *> $null
-    $unownedProcessExit = $LASTEXITCODE
+    $unownedProcessExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--uninstall', '--yes')
     $unownedProxyProcess.Refresh()
     if ($unownedProcessExit -ne 0 -and -not $unownedProxyProcess.HasExited -and (Test-Path $unownedSecret)) {
         Pass 'uninstall refuses a reused PID owned by another executable'
@@ -197,8 +201,8 @@ function global:Invoke-RestMethod {
     $env:UPDATE_LAUNCHER = Join-Path $root 'qbraid-launch.ps1'
     $env:UPDATE_URL_CAPTURE = Join-Path $tmp 'update-url'
     $env:UPDATE_PROFILE_CAPTURE = Join-Path $tmp 'update-profile'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $updateWrapper *> $null
-    if ($LASTEXITCODE -eq 0 -and (Get-Content $env:UPDATE_URL_CAPTURE -Raw) -eq 'https://qbraid.com/code.ps1' -and
+    $updateExit = Invoke-ChildPowerShell $updateWrapper
+    if ($updateExit -eq 0 -and (Get-Content $env:UPDATE_URL_CAPTURE -Raw) -eq 'https://qbraid.com/code.ps1' -and
         (Get-Content $env:UPDATE_PROFILE_CAPTURE -Raw) -eq ("alpha|True|$updateHome|$root")) {
         Pass 'update-key uses the active profile and official installer without the old key'
     } else { Fail 'update-key uses the active profile and official installer without the old key' }
@@ -227,8 +231,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyContinue
     $env:CUSTOM_UPDATE_CAPTURE = Join-Path $tmp 'custom-update-binding'
     $env:CUSTOM_UPDATE_LAUNCHER = Join-Path $customBin 'qbraid-launch.ps1'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $customUpdateWrapper *> $null
-    if ($LASTEXITCODE -eq 0 -and (Get-Content $env:CUSTOM_UPDATE_CAPTURE -Raw) -eq "$customHome|$customBin") {
+    $customUpdateExit = Invoke-ChildPowerShell $customUpdateWrapper
+    if ($customUpdateExit -eq 0 -and (Get-Content $env:CUSTOM_UPDATE_CAPTURE -Raw) -eq "$customHome|$customBin") {
         Pass 'custom sidecar binds key rotation without environment overrides'
     } else { Fail 'custom sidecar binds key rotation without environment overrides' }
 
@@ -240,8 +244,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
 & $env:OFFLINE_UNINSTALL_LAUNCHER --uninstall --yes
 '@
     $env:OFFLINE_UNINSTALL_LAUNCHER = Join-Path $customBin 'qbraid-launch.ps1'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $offlineUninstallWrapper *> $null
-    if ($LASTEXITCODE -eq 0 -and -not (Test-Path $customHome)) {
+    $offlineUninstallExit = Invoke-ChildPowerShell $offlineUninstallWrapper
+    if ($offlineUninstallExit -eq 0 -and -not (Test-Path $customHome)) {
         Pass 'custom sidecar uninstall is local and needs no environment override'
     } else { Fail 'custom sidecar uninstall is local and needs no environment override' }
 
@@ -258,10 +262,10 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     $vault.Add($invalidCredential)
     $env:USERPROFILE = $invalidProfile
     $env:QBRAID_CODE_HOME = $invalidHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $invalidBin 'qbraid-launch.ps1') --uninstall --yes *> $null
+    $invalidExit = Invoke-ChildPowerShell (Join-Path $invalidBin 'qbraid-launch.ps1') @('--uninstall', '--yes')
     $invalidCredentialStillPresent = $false
     try { $null = $vault.Retrieve($invalidCredentialResource, $env:USERNAME); $invalidCredentialStillPresent = $true } catch { }
-    if ($LASTEXITCODE -ne 0 -and $invalidCredentialStillPresent -and (Test-Path $invalidHome)) {
+    if ($invalidExit -ne 0 -and $invalidCredentialStillPresent -and (Test-Path $invalidHome)) {
         Pass 'invalid Windows Claude JSON fails before credential deletion'
     } else { Fail 'invalid Windows Claude JSON fails before credential deletion' }
 
@@ -320,8 +324,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     Write-Utf8 (Join-Path $unsafeBin 'qbraid-code.home') "$unsafeHome`n"
     $env:USERPROFILE = $unsafeProfile
     $env:QBRAID_CODE_HOME = $unsafeHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $unsafeBin 'qbraid-launch.ps1') --uninstall --yes *> $null
-    if ($LASTEXITCODE -ne 0 -and (Test-Path $outside) -and (Test-Path $unsafeHome)) { Pass 'uninstall rejects unsafe secret paths without deleting state' }
+    $unsafeExit = Invoke-ChildPowerShell (Join-Path $unsafeBin 'qbraid-launch.ps1') @('--uninstall', '--yes')
+    if ($unsafeExit -ne 0 -and (Test-Path $outside) -and (Test-Path $unsafeHome)) { Pass 'uninstall rejects unsafe secret paths without deleting state' }
     else { Fail 'uninstall rejects unsafe secret paths without deleting state' }
 
     $linkedProfile = Join-Path $tmp 'linked-user'
@@ -332,8 +336,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     New-Item -ItemType Junction -Path (Join-Path $linkedHome 'linked-outside') -Target $linkedOutside | Out-Null
     $env:USERPROFILE = $linkedProfile
     $env:QBRAID_CODE_HOME = $linkedHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --uninstall --yes *> $null
-    if ($LASTEXITCODE -ne 0 -and (Test-Path (Join-Path $linkedOutside 'keep')) -and (Test-Path $linkedHome)) {
+    $linkedExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--uninstall', '--yes')
+    if ($linkedExit -ne 0 -and (Test-Path (Join-Path $linkedOutside 'keep')) -and (Test-Path $linkedHome)) {
         Pass 'uninstall rejects managed reparse points without touching targets'
     } else { Fail 'uninstall rejects managed reparse points without touching targets' }
 
@@ -349,8 +353,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     Write-Utf8 (Join-Path $liveBin 'qbraid-code.home') "$liveHome`n"
     $env:USERPROFILE = $liveProfile
     $env:QBRAID_CODE_HOME = $liveHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $liveBin 'qbraid-launch.ps1') --uninstall --yes *> $null
-    if ($LASTEXITCODE -ne 0 -and (Test-Path $liveHome)) { Pass 'uninstall refuses a live session' } else { Fail 'uninstall refuses a live session' }
+    $liveExit = Invoke-ChildPowerShell (Join-Path $liveBin 'qbraid-launch.ps1') @('--uninstall', '--yes')
+    if ($liveExit -ne 0 -and (Test-Path $liveHome)) { Pass 'uninstall refuses a live session' } else { Fail 'uninstall refuses a live session' }
 
     $legacyProfile = Join-Path $tmp 'legacy-live-user'
     $legacyHome = Join-Path $legacyProfile '.qbraid-code'
@@ -362,8 +366,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     Write-Utf8 (Join-Path $legacyBin 'qbraid-code.home') "$legacyHome`n"
     $env:USERPROFILE = $legacyProfile
     $env:QBRAID_CODE_HOME = $legacyHome
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $legacyBin 'qbraid-launch.ps1') --uninstall --yes *> $null
-    if ($LASTEXITCODE -ne 0 -and (Test-Path $legacyHome)) { Pass 'uninstall refuses a live flat-profile session' } else { Fail 'uninstall refuses a live flat-profile session' }
+    $legacyExit = Invoke-ChildPowerShell (Join-Path $legacyBin 'qbraid-launch.ps1') @('--uninstall', '--yes')
+    if ($legacyExit -ne 0 -and (Test-Path $legacyHome)) { Pass 'uninstall refuses a live flat-profile session' } else { Fail 'uninstall refuses a live flat-profile session' }
 
     $mismatchProfile = Join-Path $tmp 'sidecar-mismatch-user'
     $mismatchDefault = Join-Path $mismatchProfile '.qbraid-code'
@@ -377,8 +381,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     Write-Utf8 (Join-Path $mismatchBin 'qbraid-code.home') "$mismatchCustom`n"
     $env:USERPROFILE = $mismatchProfile
     $env:QBRAID_CODE_HOME = $mismatchDefault
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $mismatchBin 'qbraid-launch.ps1') --uninstall --yes *> $null
-    if ($LASTEXITCODE -ne 0 -and (Test-Path (Join-Path $mismatchDefault 'keep')) -and (Test-Path (Join-Path $mismatchCustom 'keep'))) {
+    $mismatchExit = Invoke-ChildPowerShell (Join-Path $mismatchBin 'qbraid-launch.ps1') @('--uninstall', '--yes')
+    if ($mismatchExit -ne 0 -and (Test-Path (Join-Path $mismatchDefault 'keep')) -and (Test-Path (Join-Path $mismatchCustom 'keep'))) {
         Pass 'launcher sidecar cannot authorize an environment-selected installation'
     } else { Fail 'launcher sidecar mismatch deleted an installation' }
 
@@ -391,8 +395,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     try {
         $env:USERPROFILE = $mutexProfile
         $env:QBRAID_CODE_HOME = $mutexHome
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --uninstall --yes *> $null
-        if ($LASTEXITCODE -ne 0 -and (Test-Path (Join-Path $mutexHome 'keep'))) { Pass 'uninstall refuses an active Windows installer mutex' }
+        $mutexExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--uninstall', '--yes')
+        if ($mutexExit -ne 0 -and (Test-Path (Join-Path $mutexHome 'keep'))) { Pass 'uninstall refuses an active Windows installer mutex' }
         else { Fail 'uninstall refuses an active Windows installer mutex' }
     } finally {
         if ($held) { $heldMutex.ReleaseMutex() }
@@ -419,8 +423,8 @@ Remove-Item Env:QBRAID_CODE_HOME, Env:QBRAID_CODE_BIN_DIR -ErrorAction SilentlyC
     $env:USERPROFILE = $idempotentProfile
     $env:QBRAID_CODE_HOME = Join-Path $idempotentProfile '.qbraid-code'
     New-Item -ItemType Directory -Force -Path $idempotentProfile | Out-Null
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'qbraid-launch.ps1') --uninstall --yes *> $null
-    if ($LASTEXITCODE -eq 0) { Pass 'uninstall tolerates an already absent standard installation' } else { Fail 'uninstall tolerates an already absent standard installation' }
+    $idempotentExit = Invoke-ChildPowerShell (Join-Path $root 'qbraid-launch.ps1') @('--uninstall', '--yes')
+    if ($idempotentExit -eq 0) { Pass 'uninstall tolerates an already absent standard installation' } else { Fail 'uninstall tolerates an already absent standard installation' }
 } finally {
     $env:USERPROFILE = $originalUserProfile
     $env:QBRAID_CODE_HOME = $originalHome
