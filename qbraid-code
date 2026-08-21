@@ -208,6 +208,16 @@ if [ -n "$PROXY_BIN" ] && [ -x "$PROXY_BIN" ] && [ -s "$HOME_DIR/proxy-config.ya
     # fetches {base}/v1/models at startup and shows rows labeled "From
     # gateway"; GPT models appear via their anthropic-compat/ aliases.
     export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    # The picker's BUILT-IN tier rows (Opus/Sonnet/Haiku) point at Anthropic's
+    # dated first-party ids, which this proxy does not serve — selecting one
+    # silently broke the session. Remap them to the gateway's ids so every
+    # row in the picker actually routes.
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5"
+    export ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="Opus 5 (qBraid)"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="Sonnet 4.6 (qBraid)"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="Haiku 4.5 (qBraid)"
   else
     case "$RUN_MODEL" in
       gpt-*|*/gpt-*) exit 1 ;;  # start_proxy already explained

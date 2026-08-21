@@ -63,8 +63,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%QC_HOME%\qbraid-proxy.ps1"
 if errorlevel 1 goto :noproxy
 set /p RUNTOKEN=<"%QC_HOME%\proxy.key"
 set "RUNBASE=http://127.0.0.1:8320"
-rem Populate the /model picker from the proxy's model list at startup.
+rem Populate the /model picker from the proxy's model list at startup, and
+rem remap the built-in Opus/Sonnet/Haiku rows to gateway ids so every picker
+rem row actually routes (the defaults point at dated first-party ids).
 set "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1"
+set "ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5"
+set "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME=Opus 5 (qBraid)"
+set "ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6"
+set "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME=Sonnet 4.6 (qBraid)"
+set "ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4-5"
+set "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME=Haiku 4.5 (qBraid)"
 goto :routed
 :noproxy
 if /i "%RUNMODEL:~0,4%"=="gpt-" (
