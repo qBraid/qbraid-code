@@ -2,6 +2,12 @@
 # Smoke-check a real Claude Code release installed by the CI version matrix.
 set -euo pipefail
 
+if ! command -v claude >/dev/null 2>&1; then
+  printf 'Claude Code is not installed; real-release compatibility check skipped
+'
+  exit 0
+fi
+
 version=$(claude --version)
 printf 'claude: %s\n' "$version"
 
