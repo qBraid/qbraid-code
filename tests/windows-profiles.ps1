@@ -120,7 +120,7 @@ echo args=%*
         return [pscustomobject]@{}
     }
     $env:QBRAID_CODE_PROFILE_HOME = $beta
-    $doctor = (& (Join-Path $root 'doctor.ps1')) -join "`n"
+    $doctor = (& (Join-Path $root 'doctor.ps1') 6>&1) -join "`n"
     if ($doctor -notmatch 'claude:\s+2\.1\.238' -or
         $doctor -notmatch 'model:\s+claude-haiku-4-5' -or
         $doctor -notmatch 'proxy:\s+installed \(starts once per launch\)') {
