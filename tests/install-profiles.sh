@@ -51,14 +51,41 @@ EOF
 chmod +x "$FAKE_BIN/secret-tool"
 cat > "$FAKE_BIN/security" <<'EOF'
 #!/usr/bin/env bash
-action="$1"; shift; service=""
-while [ "$#" -gt 0 ]; do case "$1" in -s) service="$2"; shift 2;; -w) want_password=1; shift;; *) shift;; esac; done
-file="$HOME/.fake-key.$(printf '%s' "$service" | tr ':/' '__')"
-case "$action" in
-  add-generic-password) IFS= read -r value; printf '%s\n' "$value" > "$file" ;;
-  find-generic-password) cat "$file" ;;
-  delete-generic-password) rm -f "$file" ;;
-esac
+# Models both call shapes the installer uses:
+#   security <action> -s <ref> -w              (password on stdin)
+#   security -i                                (whole command on stdin, with
+#                                               the password as the -w value)
+# The second is what the real tool needs so it can never fall back to a tty
+# prompt; a stub that only knew the first silently stored nothing.
+run_command() { # run_command <args...>
+  local action="$1"; shift
+  local service="" password="" have_password=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -s) service="$2"; shift 2 ;;
+      -w) if [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then password="$2"; have_password=1; shift 2; else shift; fi ;;
+      *) shift ;;
+    esac
+  done
+  local file="$HOME/.fake-key.$(printf '%s' "$service" | tr ':/' '__')"
+  case "$action" in
+    add-generic-password)
+      [ "$have_password" -eq 1 ] || IFS= read -r password
+      printf '%s\n' "$password" > "$file" ;;
+    find-generic-password) cat "$file" ;;
+    delete-generic-password) rm -f "$file" ;;
+  esac
+}
+
+if [ "$1" = "-i" ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    # shellcheck disable=SC2086
+    run_command $line
+  done
+else
+  run_command "$@"
+fi
 EOF
 chmod +x "$FAKE_BIN/claude" "$FAKE_BIN/curl" "$FAKE_BIN/security" "$FAKE_BIN/cliproxyapi"
 export HOME="$HOME_ROOT" QBRAID_CODE_HOME="$QC_HOME" QBRAID_CODE_BIN_DIR="$BIN_DIR"
