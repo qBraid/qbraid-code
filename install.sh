@@ -248,8 +248,15 @@ EOF
         -e 's/.*"maxTokens"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         -e 's/.*"context_window"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
         -e 's/.*"contextWindow"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
-      [ -n "$id" ] && [ -n "$context" ] && printf '%s\t%s\n' "$id" "$context"
+      # A row without a context window is normal (the Anthropic surface does
+      # not publish one), NOT an error. Without the `|| true` this compound is
+      # the loop's last statement, so a final context-less row made the whole
+      # `while` return non-zero and `set -e` aborted the installer.
+      if [ -n "$id" ] && [ -n "$context" ]; then
+        printf '%s\t%s\n' "$id" "$context"
+      fi || true
     done >> "$tmp"
+  true
   awk -F '\t' 'NF == 2 { values[$1]=$2 } END { for (id in values) print id "\t" values[id] }' "$tmp" |
     sort > "$dest"
   rm -f "$tmp"
@@ -1082,6 +1089,11 @@ EOF
 printf '%s\n' "$PROFILE_LABEL" > "$PROFILE_DIR/label"
 printf '%s\n' "$PROFILE_LABEL_SOURCE" > "$PROFILE_DIR/label-source"
 [ -z "$ORG_ID" ] || printf '%s\n' "$ORG_ID" > "$PROFILE_DIR/organization-id"
+# The Anthropic surface (/v1/models) publishes no context windows; the
+# OpenAI-compat surface (/models) carries them under `_qbraid.maxTokens`.
+# Fetch that one, or every GPT model falls back to Claude Code's 200k
+# assumption and long sessions re-compact on every turn.
+api_get "$GATEWAY_URL/models" "$API_KEY"
 write_models_tsv "$PROFILE_DIR/models.tsv" "${API_BODY:-}"
 chmod 600 "$PROFILE_DIR/env" "$PROFILE_DIR/label" "$PROFILE_DIR/models.tsv" "$PROFILE_DIR/organization-id" 2>/dev/null || true
 umask "$OLD_UMASK"
