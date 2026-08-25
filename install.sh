@@ -170,7 +170,13 @@ adopt_legacy_profile() { # adopt_legacy_profile <root>
   if [ -n "$token" ]; then
     if [ "${OS:-linux}" = darwin ]; then
       account="${USER:-$(id -un)}"; secret_ref='qbraid-code:default'
-      printf '%s\n%s\n' "$token" "$token" | security add-generic-password -U -a "$account" -s "$secret_ref" -w >/dev/null 2>&1 \
+      # `security -i` takes the whole command on stdin. Bare `-w` relies on
+      # security reading the password from stdin, which is undocumented and
+      # falls back to a /dev/tty prompt when it does not — under `curl | bash`
+      # that surfaces as "password data for new item:" and blocks the install.
+      # -i also keeps the secret out of the process argument list.
+      printf 'add-generic-password -U -a %s -s %s -w %s\n' "$account" "$secret_ref" "$token" \
+        | security -i >/dev/null 2>&1 \
         || { rm -rf "$stage"; die "could not migrate the default key into macOS Keychain."; }
       printf 'QBRAID_CODE_SECRET_BACKEND=keychain\nQBRAID_CODE_SECRET_REF=%s\n' "$secret_ref" >> "$stage/env"
     elif command -v secret-tool >/dev/null 2>&1 && printf '%s' "$token" | secret-tool store --label='qbraid-code default profile' service qbraid-code ref qbraid-code:default >/dev/null 2>&1; then
@@ -755,8 +761,11 @@ store_profile_secret() {
   SECRET_REF="qbraid-code:$PROFILE:$GENERATION"
   if [ "$OS" = darwin ]; then
     command -v security >/dev/null 2>&1 || die "macOS Keychain is unavailable."
-    printf '%s\n%s\n' "$API_KEY" "$API_KEY" | security add-generic-password -U -a "${USER:-$(id -un)}" -s "$SECRET_REF" -w >/dev/null 2>&1 \
-      || die "could not store the profile key in macOS Keychain."
+    # See the migration path above: `security -i` cannot fall back to a tty
+    # prompt, and keeps the key out of argv.
+    printf 'add-generic-password -U -a %s -s %s -w %s\n' "${USER:-$(id -un)}" "$SECRET_REF" "$API_KEY" \
+      | security -i >/dev/null 2>&1 \
+      || die "could not store the profile key in macOS Keychain. If your login keychain is locked, unlock it in Keychain Access and re-run."
     SECRET_BACKEND="keychain"
   elif command -v secret-tool >/dev/null 2>&1 && printf '%s' "$API_KEY" | secret-tool store --label="qbraid-code $PROFILE profile" service qbraid-code ref "qbraid-code:$PROFILE:$GENERATION" >/dev/null 2>&1; then
     SECRET_REF="qbraid-code:$PROFILE:$GENERATION"
@@ -1024,7 +1033,10 @@ MODEL="${QBRAID_CODE_MODEL:-}"
 if [ "$UPDATE_KEY" -eq 1 ] && [ -z "$MODEL" ]; then MODEL="$OLD_MODEL"; fi
 if [ -z "$MODEL" ]; then
   # The list is fetched live so new gateway models appear without a release here.
-  api_get "$GATEWAY_URL/v1/models" "$API_KEY"
+  # /models (OpenAI-compat surface), NOT /v1/models (Anthropic surface): the
+  # Anthropic one lists only the Claude models, so the chooser silently hid
+  # every GPT model the launcher can actually run.
+  api_get "$GATEWAY_URL/models" "$API_KEY"
   MODEL_IDS=$(set +o pipefail; printf '%s' "$API_BODY" | grep -o '"id":"[^"]*"' | sed 's/"id":"//; s/"$//')
   if [ -z "$MODEL_IDS" ]; then
     warn "could not list models — defaulting to claude-sonnet-4-6"
